@@ -228,6 +228,101 @@ fn installs_the_tree_flat_and_reports_bins() {
 }
 
 #[test]
+fn installs_a_package_map_and_links_every_top_level_bin() {
+    // Two requested packages share `common`. All three declare a command, so all three land
+    // in `node_modules/.bin`; the requested ones come first.
+    let reg = FakeRegistry::publish(&[
+        Pkg {
+            deps: &[("common", "^1")],
+            bin: Some("run.js"),
+            ..pkg("alpha", "1.0.0")
+        },
+        Pkg {
+            deps: &[("common", "^1")],
+            bin: Some("bin/beta.js"),
+            ..pkg("beta", "2.0.0")
+        },
+        Pkg {
+            bin: Some("c.js"),
+            ..pkg("common", "1.2.0")
+        },
+    ]);
+    let dir = tempdir();
+    let all = microbe(&reg)
+        .install_all(
+            [("alpha", "*"), ("beta", "^2"), ("alpha", "0.0.1")],
+            dir.path(),
+        )
+        .unwrap();
+    let nm = dir.path().canonicalize().unwrap().join("node_modules");
+    let roots: Vec<(&str, &str)> = all
+        .roots
+        .iter()
+        .map(|r| (r.name.as_str(), r.version.as_str()))
+        .collect();
+    assert_eq!(
+        roots,
+        [("alpha", "1.0.0"), ("beta", "2.0.0")],
+        "a duplicate request is taken once, at its first range"
+    );
+    assert_eq!(all.packages, 3);
+    assert_eq!(
+        all.bins,
+        BTreeMap::from([
+            ("alpha".to_string(), nm.join("alpha/run.js")),
+            ("beta".to_string(), nm.join("beta/bin/beta.js")),
+            ("common".to_string(), nm.join("common/c.js")),
+        ])
+    );
+    #[cfg(unix)]
+    {
+        let link = nm.join(".bin/beta");
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            Path::new("../beta/bin/beta.js")
+        );
+        assert_eq!(link.canonicalize().unwrap(), nm.join("beta/bin/beta.js"));
+    }
+    #[cfg(windows)]
+    assert!(nm.join(".bin/beta.cmd").is_file());
+}
+
+#[test]
+fn reinstall_at_another_version_replaces_the_directory() {
+    // `tool@1` ships `old.js`; `tool@2` does not. Installing 2 over 1 must not leave `old.js`
+    // behind, and `.bin/tool` must now point at the new script.
+    let reg = FakeRegistry::publish(&[
+        Pkg {
+            bin: Some("old.js"),
+            ..pkg("tool", "1.0.0")
+        },
+        Pkg {
+            bin: Some("new.js"),
+            ..pkg("tool", "2.0.0")
+        },
+    ]);
+    let dir = tempdir();
+    let m = microbe(&reg);
+    m.install("tool@1", dir.path()).unwrap();
+    let nm = dir.path().canonicalize().unwrap().join("node_modules");
+    assert!(nm.join("tool/old.js").is_file());
+    let second = m.install("tool@2", dir.path()).unwrap();
+    assert_eq!(second.version, "2.0.0");
+    assert!(
+        !nm.join("tool/old.js").exists(),
+        "stale file survived the replacement"
+    );
+    assert!(nm.join("tool/new.js").is_file());
+    #[cfg(unix)]
+    assert_eq!(
+        std::fs::read_link(nm.join(".bin/tool")).unwrap(),
+        Path::new("../tool/new.js")
+    );
+    let third = m.install("tool@2", dir.path()).unwrap();
+    assert_eq!(third.packages, 0, "a satisfied request fetches nothing");
+}
+
+#[test]
 fn version_conflict_nests_under_the_dependent() {
     let reg = FakeRegistry::publish(&[
         Pkg {

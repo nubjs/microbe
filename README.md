@@ -10,7 +10,8 @@ let installed = microbe::Microbe::new()?.install("esbuild@^0.25", Path::new("/tm
 ```
 
 ```
-microbe <name[@spec]> <dir> [--registry <url>]
+microbe install <name[@spec]>... [--dir <path>] [--registry <url>]
+microbe install --from package.json --dir /tmp/tools    # its `dependencies` map; other keys are ignored
 ```
 
 ## Size
@@ -49,7 +50,7 @@ Otherwise `Microbe::new()` detects one, preferring in-binary TLS when compiled, 
 2. **`curl`** — macOS, Windows 10 and later, most full Linux distributions.
 3. **`wget`** — busybox, so Alpine.
 
-Node comes first because it is the only one of the three the use case guarantees. A survey of 16 popular container base images found `curl` on 4 of them, and 8 carried neither `curl` nor `wget`; every Node image carries Node.
+**The default build requires one of those three programs on `PATH`, or a `Transport` supplied by the embedder.** Node comes first because it is the only one of the three the use case guarantees. A survey of 16 popular container base images found `curl` on 4 of them, and 8 carried neither `curl` nor `wget`; every Node image carries Node.
 
 ## What it implements
 
