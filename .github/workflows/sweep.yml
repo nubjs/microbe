@@ -1,0 +1,52 @@
+# Real-registry sweep, run on demand: build the default binary and install real packages
+# with it on every OS, then run the bins it linked. Not part of CI, because it needs the
+# network and the registry's current state.
+name: Sweep
+on:
+  workflow_dispatch:
+jobs:
+  sweep:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: cargo build --locked --release
+      - name: Install real packages and run their bins
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in target/release/microbe target/release/microbe.exe; do [ -f "$f" ] && M=$PWD/$f; done
+          run_bin() { # <dir> <cmd> <args...>
+            local dir=$1 cmd=$2; shift 2
+            local bin="$dir/node_modules/.bin/$cmd"
+            [ -f "$bin.cmd" ] && bin="$bin.cmd"
+            "$bin" "$@"
+          }
+          echo "== spec installs"
+          for pkg in eslint vite typescript esbuild; do
+            d=$RUNNER_TEMP/spec-$pkg; "$M" install "$pkg" --dir "$d" | tail -3
+          done
+          run_bin "$RUNNER_TEMP/spec-eslint" eslint --version
+          run_bin "$RUNNER_TEMP/spec-vite" vite --version
+          run_bin "$RUNNER_TEMP/spec-typescript" tsc --version
+          run_bin "$RUNNER_TEMP/spec-esbuild" esbuild --version
+          echo "== package map through --from, with an explicit .npmrc"
+          d=$RUNNER_TEMP/map
+          printf '{"name":"x","dependencies":{"express":"^5","@types/node":"22","is-odd":"^3"},"devDependencies":{"nope":"1"}}' > "$RUNNER_TEMP/package.json"
+          printf 'registry=https://registry.npmjs.org/\n//registry.npmjs.org/:_authToken=${NPM_TOKEN}\n' > "$RUNNER_TEMP/bad.npmrc"
+          if "$M" install --from "$RUNNER_TEMP/package.json" --dir "$d" --npmrc "$RUNNER_TEMP/bad.npmrc"; then echo "unexpanded \${VAR} was accepted"; exit 1; fi
+          printf 'registry=https://registry.npmjs.org/\n' > "$RUNNER_TEMP/ok.npmrc"
+          "$M" install --from "$RUNNER_TEMP/package.json" --dir "$d" --npmrc "$RUNNER_TEMP/ok.npmrc" | head -5
+          [ ! -e "$d/node_modules/nope" ]
+          node -e "const e=require(require('path').join(process.argv[1],'node_modules','express')); console.log('express', typeof e)" "$d"
+          node -e "console.log('is-odd', require(require('path').join(process.argv[1],'node_modules','is-odd'))(3))" "$d"
+          test -f "$d/node_modules/@types/node/package.json"
+          echo "== a second install over the first fetches nothing"
+          "$M" install --from "$RUNNER_TEMP/package.json" --dir "$d" | grep -x '0 packages'
