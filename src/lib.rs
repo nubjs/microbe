@@ -438,7 +438,7 @@ impl Microbe {
             .filter(|(prefix, _)| nerf.starts_with(prefix.as_str()))
             .max_by_key(|(prefix, _)| prefix.len())
         {
-            headers.push(("authorization", value.as_str()));
+            headers.push(("x-authorization", value.as_str()));
         }
         self.transport.get(url, &headers)
     }
