@@ -1,18 +1,26 @@
-//! How bytes get here. The 1 MB budget is decided entirely by TLS (a rustls + ring stack is
-//! ~500 KB on macOS and over 1 MB static on Linux), so by default this crate links NO TLS
-//! and borrows an HTTPS client the host already has. `detect` tries, in order:
+//! How bytes get here. The 1 MB budget is decided entirely by TLS: a rustls stack costs
+//! about 1 MB on Linux, so the Linux build links NO TLS by default and borrows an HTTPS
+//! client the host already has. On macOS and Windows the operating system's own TLS is
+//! reachable through Rust bindings for about 300 KB, with no C compiled and no process
+//! spawned, so there it is always in. `detect` tries, in order:
 //!
-//! 1. In-binary TLS, when built with `--features tls` (platform TLS on macOS/Windows,
-//!    rustls elsewhere).
+//! 1. In-binary TLS: always on macOS and Windows (Security.framework / SChannel), and on
+//!    Linux only with `--features tls` (rustls).
 //! 2. `node` — a single long-lived child running `fetch`. Node is the one thing the use case
 //!    guarantees on the box: whatever gets installed is about to be run by it. This is what
 //!    makes the chain terminate on slim container images, where a 2026-09-17 survey of 16
 //!    popular bases found curl on 4 and neither curl nor wget on 8.
-//! 3. `curl` (ships with macOS and Windows 10+, most full Linux distributions).
+//! 3. `curl` (most full Linux distributions).
 //! 4. `wget` (busybox on Alpine).
+//! 5. `python3` — the Python container images carry neither curl nor wget, but do carry
+//!    Python with its ssl module and a CA bundle. Not tried on macOS, where a missing
+//!    `python3` is a stub that opens a dialog offering to install the developer tools.
 //!
-//! An embedder with its own HTTP client skips all of this by implementing [`Transport`].
-//! Every transport here is safe to call from many threads at once; the installer does.
+//! The host clients are told to refuse a redirect off HTTPS: a tarball is protected by its
+//! integrity hash, but a packument is not, so a downgrade could substitute a tarball and its
+//! hash together. An embedder with its own HTTP client skips all of this by implementing
+//! [`Transport`]. Every transport here is safe to call from many threads at once; the
+//! installer does.
 
 use crate::error::Error;
 use std::collections::HashMap;
@@ -29,9 +37,9 @@ pub trait Transport: Send + Sync {
 
 /// The first transport available, in the order documented above.
 pub fn detect() -> Result<Box<dyn Transport>, Error> {
-    #[cfg(feature = "tls")]
+    #[cfg(any(feature = "tls", target_os = "macos", target_os = "windows"))]
     return Ok(Box::new(builtin::Builtin::new()));
-    #[cfg(not(feature = "tls"))]
+    #[cfg(not(any(feature = "tls", target_os = "macos", target_os = "windows")))]
     detect_host()
 }
 
@@ -48,7 +56,10 @@ pub fn detect_host() -> Result<Box<dyn Transport>, Error> {
     if available("wget") {
         return Ok(Box::new(Wget));
     }
-    Err(Error::NoTransport(vec!["node", "curl", "wget"]))
+    if !cfg!(target_os = "macos") && available("python3") {
+        return Ok(Box::new(Python));
+    }
+    Err(Error::NoTransport(vec!["node", "curl", "wget", "python3"]))
 }
 
 fn available(program: &str) -> bool {
@@ -206,22 +217,48 @@ impl Drop for NodeFetch {
 
 pub struct Curl;
 
+/// `-w` appends the status after the body, split back off in `get`; `--proto` and
+/// `--proto-redir` pin both the request and any redirect to HTTPS.
+fn curl_args(url: &str, accept: &str) -> Vec<String> {
+    [
+        "-fsSL",
+        "--compressed",
+        "--proto",
+        "=https",
+        "--proto-redir",
+        "=https",
+        "-w",
+        "\n%{http_code}",
+        "-H",
+        &format!("accept: {accept}"),
+        url,
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+fn wget_args(url: &str, accept: &str) -> Vec<String> {
+    [
+        "-q",
+        "--https-only",
+        "-O",
+        "-",
+        &format!("--header=accept: {accept}"),
+        url,
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
 impl Transport for Curl {
     fn get(&self, url: &str, accept: &str) -> Result<Vec<u8>, Error> {
         let out = Command::new("curl")
-            .args([
-                "-fsSL",
-                "--compressed",
-                "-w",
-                "\n%{http_code}",
-                "-H",
-                &format!("accept: {accept}"),
-                url,
-            ])
+            .args(curl_args(url, accept))
             .stdin(Stdio::null())
             .output()
             .map_err(|e| Error::Transport(format!("curl: {e}")))?;
-        // `-w` appends the status after the body; split it back off.
         let body = out.stdout;
         let cut = body.iter().rposition(|&b| b == b'\n').unwrap_or(body.len());
         let status: u16 = std::str::from_utf8(&body[cut..])
@@ -244,7 +281,7 @@ pub struct Wget;
 impl Transport for Wget {
     fn get(&self, url: &str, accept: &str) -> Result<Vec<u8>, Error> {
         let out = Command::new("wget")
-            .args(["-q", "-O", "-", &format!("--header=accept: {accept}"), url])
+            .args(wget_args(url, accept))
             .stdin(Stdio::null())
             .output()
             .map_err(|e| Error::Transport(format!("wget: {e}")))?;
@@ -261,10 +298,56 @@ impl Transport for Wget {
 // ---------------------------------------------------------------------------------------
 // In-binary TLS (opt-in). ureq's Agent pools connections and is safe to share across threads.
 
-#[cfg(feature = "tls")]
+/// One `python3` process per request, using the standard library's `urllib` and `ssl`.
+/// The body goes to stdout; an HTTP error puts its status on stderr and exits 3; a redirect
+/// off HTTPS is refused.
+pub struct Python;
+
+const PYTHON_SCRIPT: &str = r#"
+import sys, urllib.request, urllib.error
+url, accept = sys.argv[1], sys.argv[2]
+class HttpsOnly(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not newurl.startswith("https://"):
+            raise urllib.error.HTTPError(newurl, code, "redirect off https refused", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+opener = urllib.request.build_opener(HttpsOnly())
+try:
+    with opener.open(urllib.request.Request(url, headers={"accept": accept})) as r:
+        sys.stdout.buffer.write(r.read())
+except urllib.error.HTTPError as e:
+    sys.stderr.write(str(e.code))
+    sys.exit(3)
+"#;
+
+impl Transport for Python {
+    fn get(&self, url: &str, accept: &str) -> Result<Vec<u8>, Error> {
+        let out = Command::new("python3")
+            .args(["-c", PYTHON_SCRIPT, url, accept])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| Error::Transport(format!("python3: {e}")))?;
+        if out.status.success() {
+            return Ok(out.stdout);
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        match (out.status.code(), stderr.trim().parse::<u16>()) {
+            (Some(3), Ok(status)) => check_status(url, status).map(|()| Vec::new()),
+            _ => Err(Error::Transport(format!(
+                "python3 exited {} for {url}: {}",
+                out.status,
+                stderr.trim()
+            ))),
+        }
+    }
+}
+
+#[cfg(any(feature = "tls", target_os = "macos", target_os = "windows"))]
 mod builtin {
     use super::{Transport, check_status};
     use crate::error::Error;
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    use ureq_rustls as ureq;
 
     pub struct Builtin(ureq::Agent);
 
@@ -315,6 +398,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn host_clients_refuse_to_leave_https() {
+        let curl = curl_args("https://r/x", "*/*");
+        let proto = curl.iter().position(|a| a == "--proto").unwrap();
+        let redir = curl.iter().position(|a| a == "--proto-redir").unwrap();
+        assert_eq!(
+            (&curl[proto + 1], &curl[redir + 1]),
+            (&"=https".into(), &"=https".into())
+        );
+        assert!(wget_args("https://r/x", "*/*").contains(&"--https-only".to_string()));
+        assert!(PYTHON_SCRIPT.contains("redirect off https refused"));
+    }
+
+    #[test]
+    fn python_transport_reports_http_status() {
+        if cfg!(target_os = "macos") || !available("python3") {
+            return;
+        }
+        let port = barrier_server();
+        assert_eq!(
+            Python
+                .get(&format!("http://127.0.0.1:{port}/fast"), "*/*")
+                .unwrap(),
+            b"fast-body"
+        );
+        let err = Python
+            .get(&format!("http://127.0.0.1:{port}/missing"), "*/*")
+            .unwrap_err();
+        assert!(matches!(err, Error::Status { status: 404, .. }), "{err}");
+    }
+
+    #[test]
     fn missing_programs_are_reported_absent_not_as_errors() {
         assert!(!available("microbe-definitely-not-a-program"));
     }
@@ -340,7 +454,9 @@ mod tests {
                         return;
                     }
                     let (flag, cv) = &*fast_seen;
-                    let (status, body) = if line.contains("/fast") {
+                    let (status, body) = if line.contains("/missing") {
+                        ("404 Not Found", "no such path")
+                    } else if line.contains("/fast") {
                         *flag.lock().unwrap() = true;
                         cv.notify_all();
                         ("200 OK", "fast-body")

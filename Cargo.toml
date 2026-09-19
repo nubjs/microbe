@@ -20,10 +20,10 @@ description = "The smallest embeddable npm package installer: one package and it
 
 [features]
 default = []
-# In-binary TLS. Platform TLS (Security.framework / SChannel) on macOS and Windows, where it
-# costs ~330 KB; rustls + ring elsewhere, where it costs ~1 MB. Off by default because the
-# host-provided transports below cost nothing.
-tls = ["dep:ureq"]
+# In-binary TLS on Linux, through rustls, where it costs about 1 MB and so is opt-in. On
+# macOS and Windows the platform TLS (Security.framework / SChannel) is always linked — about
+# 300 KB, no C compiled, no process spawned — and this feature changes nothing.
+tls = ["dep:ureq-rustls"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -39,10 +39,10 @@ base64 = "0.22"
 node-semver = "2"
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
-ureq = { version = "3", default-features = false, features = ["gzip", "native-tls"], optional = true }
+ureq = { version = "3", default-features = false, features = ["gzip", "native-tls"] }
 
 [target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.dependencies]
-ureq = { version = "3", default-features = false, features = ["gzip", "rustls"], optional = true }
+ureq-rustls = { package = "ureq", version = "3", default-features = false, features = ["gzip", "rustls"], optional = true }
 
 [[bin]]
 name = "microbe"
