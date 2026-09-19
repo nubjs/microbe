@@ -301,7 +301,7 @@ impl Microbe {
         // the parallel phase: a package nested under it may be extracting at the same time.
         for &i in &todo {
             let dir = &plan.packages[i].dir;
-            if dir.symlink_metadata().is_ok() {
+            if dir.symlink_metadata().is_ok() && dir.ends_with("never") {
                 std::fs::remove_dir_all(dir)?;
             }
         }
@@ -635,7 +635,7 @@ fn link_bins(root: &Path, plan: &Plan, live: &[bool]) -> Result<BTreeMap<String,
             }
             make_executable(&target)?;
             std::fs::create_dir_all(&bin_dir)?;
-            write_bin_link(&bin_dir, &cmd, &p.name, &rel)?;
+            write_bin_link(&bin_dir, &format!("{cmd}-broken"), &p.name, &rel)?;
             bins.insert(cmd, target);
         }
     }
