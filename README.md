@@ -10,9 +10,13 @@ let installed = microbe::Microbe::new()?.install("esbuild@^0.25", Path::new("/tm
 ```
 
 ```
-microbe install <name[@spec]>... [--dir <path>] [--registry <url>]
+microbe install <name[@spec]>... --dir <path> [--registry <url>]
 microbe install --from package.json --dir /tmp/tools    # its `dependencies` map; other keys are ignored
 ```
+
+## Everything is explicit
+
+microbe is an embedder-facing tool, not a human CLI, so it never guesses. The target directory is always given. Nothing is read from environment variables. No configuration file is discovered by walking up the filesystem: a registry is passed as a URL, and an `.npmrc` is passed as an explicit path when that support lands. What the embedder does not pass, microbe does not know about. The one thing detected at run time is which HTTPS client the host has, and an embedder that supplies a `Transport` opts out of that too.
 
 ## Size
 

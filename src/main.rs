@@ -1,6 +1,8 @@
-//! `microbe install [<name[@spec]>...] [--from <file|->] [--dir <path>] [--registry <url>]`
-//! installs into `<dir>/node_modules` (the current directory by default) and prints what
-//! landed. Specs name packages directly; `--from` reads a JSON file (or stdin with `-`) and
+//! `microbe install [<name[@spec]>...] [--from <file|->] --dir <path> [--registry <url>]`
+//! installs into `<dir>/node_modules` and prints what landed. Everything is explicit: the
+//! target directory is required, nothing is read from the environment, and no file is
+//! discovered by walking the filesystem — the embedder decides where configuration comes
+//! from. This is an embedder-facing tool, not a human CLI. Specs name packages directly; `--from` reads a JSON file (or stdin with `-`) and
 //! takes its `dependencies` map — the `package.json#/dependencies` shape — so a whole
 //! `package.json` is a valid input and its other keys are ignored. The library is the
 //! product; this binary exists to measure it and to try it from a shell.
@@ -9,7 +11,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 const USAGE: &str =
-    "usage: microbe install [<name[@spec]>...] [--from <file|->] [--dir <path>] [--registry <url>]";
+    "usage: microbe install [<name[@spec]>...] [--from <file|->] --dir <path> [--registry <url>]";
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
@@ -27,11 +29,14 @@ fn main() -> ExitCode {
             _ => specs.push(a),
         }
     }
-    if verb.as_deref() != Some("install") || (specs.is_empty() && from.is_none()) {
+    let (Some("install"), Some(dir)) = (verb.as_deref(), dir) else {
+        eprintln!("{USAGE}");
+        return ExitCode::from(2);
+    };
+    if specs.is_empty() && from.is_none() {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     }
-    let dir = dir.unwrap_or_else(|| ".".to_string());
     let run = || -> Result<microbe::Installation, microbe::Error> {
         let mut m = microbe::Microbe::new()?;
         if let Some(r) = &registry {
