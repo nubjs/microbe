@@ -1,4 +1,5 @@
-//! microbe — install one npm package and its dependency tree into a directory.
+//! microbe — install npm packages and their dependency trees into a directory: one package
+//! by spec, or a `package.json`-shaped map of names to ranges.
 //!
 //! ```no_run
 //! let installed = microbe::Microbe::new()?.install("esbuild@^0.25", std::path::Path::new("/tmp/x"))?;
@@ -19,8 +20,9 @@
 //! does) or it reaches something required (the install fails). See [`settle`].
 //!
 //! What it deliberately does not do: run lifecycle scripts (reported instead, see
-//! [`Installed::skipped_install_scripts`]), honour `peerDependencies`, write a lockfile, keep
-//! a cache or store, or reconcile with an existing `node_modules`. Those are the parts of a
+//! [`Installation::skipped_install_scripts`]), honour `peerDependencies`, write a lockfile,
+//! keep a cache or store, or reconcile with an existing `node_modules` beyond replacing a
+//! package it is about to install at another version. Those are the parts of a
 //! package manager that take up the space.
 
 mod error;
@@ -49,8 +51,9 @@ pub struct Microbe {
     packuments: Mutex<HashMap<String, Packument>>,
 }
 
-/// What an install produced. `bins` maps each command the root package declares to the
-/// absolute path of its script, with the executable bit set.
+/// What [`Microbe::install`] produced. `bins` maps each command the package declares to the
+/// absolute path of its script, with the executable bit set; the same commands are linked
+/// under `<dir>/node_modules/.bin`.
 #[derive(Debug)]
 pub struct Installed {
     pub name: String,
@@ -62,6 +65,28 @@ pub struct Installed {
     pub packages: usize,
     /// `name@version` of every package whose install script was NOT run.
     pub skipped_install_scripts: Vec<String>,
+}
+
+/// What [`Microbe::install_all`] produced.
+#[derive(Debug)]
+pub struct Installation {
+    /// The requested packages, in request order.
+    pub roots: Vec<Root>,
+    /// Every command linked under `<dir>/node_modules/.bin`, mapped to the absolute path of
+    /// the script it runs. Requested packages win a name clash with a dependency.
+    pub bins: BTreeMap<String, PathBuf>,
+    /// Packages extracted.
+    pub packages: usize,
+    /// `name@version` of every package whose install script was NOT run.
+    pub skipped_install_scripts: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct Root {
+    pub name: String,
+    pub version: String,
+    /// `<dir>/node_modules/<name>`.
+    pub dir: PathBuf,
 }
 
 impl Microbe {
@@ -98,22 +123,55 @@ impl Microbe {
     /// `dir` is created if needed; packages go under `dir/node_modules/`.
     pub fn install(&self, spec: &str, dir: &Path) -> Result<Installed, Error> {
         let (name, range) = split_spec(spec);
+        let mut all = self.install_all([(name, range)], dir)?;
+        let root = all.roots.remove(0);
+        Ok(Installed {
+            bins: all
+                .bins
+                .into_iter()
+                .filter(|(_, path)| path.starts_with(&root.dir))
+                .collect(),
+            name: root.name,
+            version: root.version,
+            dir: root.dir,
+            packages: all.packages,
+            skipped_install_scripts: all.skipped_install_scripts,
+        })
+    }
+
+    /// Install every `(name, range)` pair — the shape of a `package.json` `dependencies`
+    /// map — into one `dir/node_modules`, and link every command a top-level package
+    /// declares under `dir/node_modules/.bin`. A name given twice is taken once, at its
+    /// first range. `peerDependencies` are ignored throughout.
+    pub fn install_all<'a>(
+        &self,
+        deps: impl IntoIterator<Item = (&'a str, &'a str)>,
+        dir: &Path,
+    ) -> Result<Installation, Error> {
+        let mut seen = HashSet::new();
+        let deps: Vec<(&str, &str)> = deps
+            .into_iter()
+            .filter(|(name, _)| seen.insert(*name))
+            .collect();
         std::fs::create_dir_all(dir)?;
         let root = dir.canonicalize()?;
-        let mut plan = self.plan(&root, name, range)?;
+        let mut plan = self.plan(&root, &deps)?;
         let live = self.materialize(&mut plan)?;
-        let head = &plan.packages[0];
-        let mut bins = BTreeMap::new();
-        for (cmd, rel) in head.manifest.bin.entries(name) {
-            let path = head.dir.join(rel);
-            make_executable(&path)?;
-            bins.insert(cmd, path);
-        }
+        let bins = link_bins(&root, &plan, &live)?;
         let kept = || plan.packages.iter().zip(&live).filter(|(_, l)| **l);
-        Ok(Installed {
-            name: name.to_string(),
-            version: head.version.clone(),
-            dir: head.dir.clone(),
+        Ok(Installation {
+            roots: plan
+                .roots
+                .iter()
+                .map(|&i| {
+                    let p = &plan.packages[i];
+                    Root {
+                        name: p.name.clone(),
+                        version: p.version.clone(),
+                        dir: p.dir.clone(),
+                    }
+                })
+                .collect(),
             bins,
             packages: kept().filter(|(p, _)| p.fetch).count(),
             skipped_install_scripts: kept()
@@ -124,46 +182,60 @@ impl Microbe {
     }
 
     /// Phase one. Breadth-first so that placement is deterministic: whichever version of a
-    /// name is reached first from the root takes the flat slot, and later conflicting
-    /// versions nest under their dependents. Each level's packuments are fetched together
-    /// before any of that level is placed.
-    fn plan(&self, root: &Path, name: &str, range: &str) -> Result<Plan, Error> {
+    /// name is reached first from the requested packages takes the flat slot, and later
+    /// conflicting versions nest under their dependents. Each level's packuments are fetched
+    /// together before any of that level is placed.
+    fn plan(&self, root: &Path, deps: &[(&str, &str)]) -> Result<Plan, Error> {
         let mut plan = Plan::default();
-        let mut level = VecDeque::from([Want {
-            parent: None,
-            parent_dir: root.to_path_buf(),
-            name: name.to_string(),
-            range: range.to_string(),
-            optional_edge: false,
-            soft: false,
-        }]);
+        let mut level: VecDeque<Want> = deps
+            .iter()
+            .map(|(name, range)| Want {
+                parent: None,
+                parent_dir: root.to_path_buf(),
+                name: name.to_string(),
+                range: range.to_string(),
+                optional_edge: false,
+                soft: false,
+            })
+            .collect();
         while !level.is_empty() {
             self.prefetch(level.iter().map(|w| w.name.as_str()));
             let mut next = VecDeque::new();
             for want in level.drain(..) {
-                if let Some(i) = self.place(root, &mut plan, &want)? {
+                let placed = match self.place(root, &mut plan, &want)? {
+                    Some(i) => Some(i),
+                    // A requested package already on disk at a satisfying version is planned
+                    // unfetched, so its bins are still linked and its own tree still checked.
+                    None if want.parent.is_none() => {
+                        Some(self.plan_present(root, &mut plan, &want)?)
+                    }
+                    None => None,
+                };
+                if let Some(i) = placed {
+                    if want.parent.is_none() {
+                        plan.roots.push(i);
+                    }
                     next.extend(plan.packages[i].wants(i, want.soft));
                 }
             }
             level = next;
         }
-        if plan.packages.is_empty() {
-            // The root was already on disk at a satisfying version; plan it unfetched so
-            // the caller still gets its manifest and bins.
-            let (version, dir) = plan
-                .satisfied(root, root, name, range)?
-                .expect("root either planned or found");
-            let manifest = self.manifest_for(name, &version)?;
-            plan.push(Planned {
-                name: name.to_string(),
-                version,
-                dir,
-                manifest,
-                fetch: false,
-                children: Vec::new(),
-            });
-        }
         Ok(plan)
+    }
+
+    fn plan_present(&self, root: &Path, plan: &mut Plan, want: &Want) -> Result<usize, Error> {
+        let (version, dir) = plan
+            .satisfied(root, root, &want.name, &want.range)?
+            .expect("a requested package is either placed or already present");
+        let manifest = self.manifest_for(&want.name, &version)?;
+        Ok(plan.push(Planned {
+            name: want.name.clone(),
+            version,
+            dir,
+            manifest,
+            fetch: false,
+            children: Vec::new(),
+        }))
     }
 
     /// Decide where one wanted package goes. Returns the index of a newly planned package so
@@ -220,10 +292,19 @@ impl Microbe {
     /// [`settle`] with the fetch failures folded in. Returns which packages are live, and
     /// removes from disk whatever a dropped branch had already extracted.
     fn materialize(&self, plan: &mut Plan) -> Result<Vec<bool>, Error> {
-        let before = settle(&plan.packages, std::mem::take(&mut plan.failures))?;
+        let failures = std::mem::take(&mut plan.failures);
+        let before = settle(plan, failures)?;
         let todo: Vec<usize> = (0..plan.packages.len())
             .filter(|&i| before.live[i] && plan.packages[i].fetch)
             .collect();
+        // A directory about to receive another version is replaced, not overlaid, and before
+        // the parallel phase: a package nested under it may be extracting at the same time.
+        for &i in &todo {
+            let dir = &plan.packages[i].dir;
+            if dir.symlink_metadata().is_ok() {
+                std::fs::remove_dir_all(dir)?;
+            }
+        }
         let next = AtomicUsize::new(0);
         let failed: Mutex<Vec<(usize, Error)>> = Mutex::new(Vec::new());
         std::thread::scope(|s| {
@@ -249,7 +330,7 @@ impl Microbe {
         failed.sort_by_key(|(i, _)| *i);
         let seeds = before.dropped_seeds.into_iter().map(|i| (i, None));
         let after = settle_seeded(
-            &plan.packages,
+            plan,
             seeds.chain(failed.into_iter().map(|(i, e)| (i, Some(e)))),
         )?;
         for &i in &todo {
@@ -342,7 +423,7 @@ impl Microbe {
 
 /// One dependency edge waiting to be placed.
 struct Want {
-    /// Index of the dependent in the plan; `None` for the requested package itself.
+    /// Index of the dependent in the plan; `None` for a requested package.
     parent: Option<usize>,
     parent_dir: PathBuf,
     name: String,
@@ -397,8 +478,10 @@ impl Planned {
 
 #[derive(Default)]
 struct Plan {
-    /// In placement order; the first entry is the requested package.
+    /// In placement order.
     packages: Vec<Planned>,
+    /// Indices of the requested packages, in request order.
+    roots: Vec<usize>,
     /// Directory → index into `packages`.
     index: HashMap<PathBuf, usize>,
     /// `(package to drop, why)`: a package whose required dependency could not be resolved.
@@ -459,24 +542,26 @@ struct Settled {
     dropped_seeds: Vec<usize>,
 }
 
-fn settle(packages: &[Planned], failures: Vec<(usize, Error)>) -> Result<Settled, Error> {
-    settle_seeded(packages, failures.into_iter().map(|(i, e)| (i, Some(e))))
+fn settle(plan: &Plan, failures: Vec<(usize, Error)>) -> Result<Settled, Error> {
+    settle_seeded(plan, failures.into_iter().map(|(i, e)| (i, Some(e))))
 }
 
 /// Decide what survives. Each seed names a package that cannot be installed. A dropped
 /// package drops every dependent that reaches it over a NON-optional edge, transitively; an
-/// optional edge absorbs the failure. If a seed's climb reaches a package the root requires —
-/// reachable over non-optional edges alone — the install fails with THAT seed's error: an
+/// optional edge absorbs the failure. If a seed's climb reaches a required package — one a
+/// requested package reaches over non-optional edges alone — the install fails with THAT seed's error: an
 /// earlier failure that an optional edge absorbed is not what made the install fatal, so it
 /// is never the one reported. Whatever is then unreachable from the root through surviving
 /// packages is not live, which is what removes a dropped branch's own dependencies with it.
+/// "Reachable" is always from the requested packages, so a requested package is never dropped.
 fn settle_seeded(
-    packages: &[Planned],
+    plan: &Plan,
     seeds: impl Iterator<Item = (usize, Option<Error>)>,
 ) -> Result<Settled, Error> {
+    let packages = &plan.packages;
     let reach = |follow_optional: bool, skip: &[bool]| {
         let mut seen = vec![false; packages.len()];
-        let mut stack = vec![0];
+        let mut stack = plan.roots.clone();
         while let Some(i) = stack.pop() {
             if seen[i] || skip[i] {
                 continue;
@@ -522,6 +607,59 @@ fn settle_seeded(
         live: reach(true, &dropped),
         dropped_seeds,
     })
+}
+
+/// Link every command a top-level package declares into `node_modules/.bin`, requested
+/// packages first so theirs win a name clash, then in placement order. A relative symlink on
+/// Unix; on Windows a `.cmd` shim that runs the script with `node`, which every npm bin in
+/// practice is (npm's own shim also reads the shebang; nothing here needs that yet).
+fn link_bins(root: &Path, plan: &Plan, live: &[bool]) -> Result<BTreeMap<String, PathBuf>, Error> {
+    let nm = root.join("node_modules");
+    let bin_dir = nm.join(".bin");
+    let mut bins = BTreeMap::new();
+    let rest = (0..plan.packages.len()).filter(|i| !plan.roots.contains(i));
+    for i in plan.roots.iter().copied().chain(rest) {
+        let p = &plan.packages[i];
+        if !live[i] || p.dir != nm.join(&p.name) {
+            continue;
+        }
+        for (cmd, rel) in p.manifest.bin.entries(&p.name) {
+            let target = p.dir.join(&rel);
+            if bins.contains_key(&cmd)
+                || cmd.is_empty()
+                || cmd.contains(['/', '\\'])
+                || cmd == ".."
+                || !target.is_file()
+            {
+                continue;
+            }
+            make_executable(&target)?;
+            std::fs::create_dir_all(&bin_dir)?;
+            write_bin_link(&bin_dir, &cmd, &p.name, &rel)?;
+            bins.insert(cmd, target);
+        }
+    }
+    Ok(bins)
+}
+
+#[cfg(unix)]
+fn write_bin_link(bin_dir: &Path, cmd: &str, name: &str, rel: &str) -> Result<(), Error> {
+    let link = bin_dir.join(cmd);
+    if link.symlink_metadata().is_ok() {
+        std::fs::remove_file(&link)?;
+    }
+    std::os::unix::fs::symlink(Path::new("..").join(name).join(rel), &link)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_bin_link(bin_dir: &Path, cmd: &str, name: &str, rel: &str) -> Result<(), Error> {
+    let script = format!("{name}\\{rel}").replace('/', "\\");
+    std::fs::write(
+        bin_dir.join(format!("{cmd}.cmd")),
+        format!("@ECHO off\r\nnode \"%~dp0\\..\\{script}\" %*\r\n"),
+    )?;
+    Ok(())
 }
 
 fn installed_version(pkg_dir: &Path) -> Result<Option<String>, Error> {

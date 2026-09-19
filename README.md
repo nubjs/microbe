@@ -10,8 +10,13 @@ let installed = microbe::Microbe::new()?.install("esbuild@^0.25", Path::new("/tm
 ```
 
 ```
-microbe <name[@spec]> <dir> [--registry <url>]
+microbe install <name[@spec]>... --dir <path> [--registry <url>]
+microbe install --from package.json --dir /tmp/tools    # its `dependencies` map; other keys are ignored
 ```
+
+## Everything is explicit
+
+microbe is an embedder-facing tool, not a human CLI, so it never guesses. The target directory is always given. Nothing is read from environment variables. No configuration file is discovered by walking up the filesystem: a registry is passed as a URL, and an `.npmrc` is passed as an explicit path when that support lands. What the embedder does not pass, microbe does not know about. The one thing detected at run time is which HTTPS client the host has, and an embedder that supplies a `Transport` opts out of that too.
 
 ## Size
 
@@ -49,7 +54,7 @@ Otherwise `Microbe::new()` detects one, preferring in-binary TLS when compiled, 
 2. **`curl`** — macOS, Windows 10 and later, most full Linux distributions.
 3. **`wget`** — busybox, so Alpine.
 
-Node comes first because it is the only one of the three the use case guarantees. A survey of 16 popular container base images found `curl` on 4 of them, and 8 carried neither `curl` nor `wget`; every Node image carries Node.
+**The default build requires one of those three programs on `PATH`, or a `Transport` supplied by the embedder.** Node comes first because it is the only one of the three the use case guarantees. A survey of 16 popular container base images found `curl` on 4 of them, and 8 carried neither `curl` nor `wget`; every Node image carries Node.
 
 ## What it implements
 
