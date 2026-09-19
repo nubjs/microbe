@@ -1,4 +1,4 @@
-//! `microbe install [<name[@spec]>...] [--from <file|->] --dir <path> [--registry <url>]`
+//! `microbe install [<name[@spec]>...] [--from <file|->] --dir <path> [--registry <url>] [--npmrc <file>]`
 //! installs into `<dir>/node_modules` and prints what landed. Everything is explicit: the
 //! target directory is required, nothing is read from the environment, and no file is
 //! discovered by walking the filesystem — the embedder decides where configuration comes
@@ -10,8 +10,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-const USAGE: &str =
-    "usage: microbe install [<name[@spec]>...] [--from <file|->] --dir <path> [--registry <url>]";
+const USAGE: &str = "usage: microbe install [<name[@spec]>...] [--from <file|->] --dir <path> [--registry <url>] [--npmrc <file>]";
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
@@ -19,12 +18,14 @@ fn main() -> ExitCode {
     let mut from = None;
     let mut dir = None;
     let mut registry = None;
+    let mut npmrc = None;
     let mut verb = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--registry" => registry = args.next(),
             "--dir" => dir = args.next(),
             "--from" => from = args.next(),
+            "--npmrc" => npmrc = args.next(),
             _ if verb.is_none() => verb = Some(a),
             _ => specs.push(a),
         }
@@ -39,6 +40,9 @@ fn main() -> ExitCode {
     }
     let run = || -> Result<microbe::Installation, microbe::Error> {
         let mut m = microbe::Microbe::new()?;
+        if let Some(path) = &npmrc {
+            m = m.npmrc(Path::new(path))?;
+        }
         if let Some(r) = &registry {
             m = m.registry(r);
         }

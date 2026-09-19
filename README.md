@@ -16,7 +16,11 @@ microbe install --from package.json --dir /tmp/tools    # its `dependencies` map
 
 ## Everything is explicit
 
-microbe is an embedder-facing tool, not a human CLI, so it never guesses. The target directory is always given. Nothing is read from environment variables. No configuration file is discovered by walking up the filesystem: a registry is passed as a URL, and an `.npmrc` is passed as an explicit path when that support lands. What the embedder does not pass, microbe does not know about. The one thing detected at run time is which HTTPS client the host has, and an embedder that supplies a `Transport` opts out of that too.
+microbe is an embedder-facing tool, not a human CLI, so it never guesses. The target directory is always given. Nothing is read from environment variables. No configuration file is discovered by walking up the filesystem: a registry is passed as a URL, and an `.npmrc` is passed as an explicit path. What the embedder does not pass, microbe does not know about. The one thing detected at run time is which HTTPS client the host has, and an embedder that supplies a `Transport` opts out of that too.
+
+## Registry and credentials
+
+An `.npmrc` is applied only from an explicit path (`Microbe::npmrc`, or `--npmrc <file>`), or from contents the embedder already holds (`Microbe::npmrc_contents`). Four keys are read: `registry`, `@scope:registry`, and the credential forms `_authToken`, `_auth`, and `username` with `_password`, each keyed by URL prefix exactly as npm keys them. `${VAR}` is not expanded, because nothing is read from the environment; a consumed key that still holds one is an error, so a placeholder is never sent as a token.
 
 ## Size
 

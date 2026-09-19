@@ -37,15 +37,20 @@ const fn pkg(name: &'static str, version: &'static str) -> Pkg {
 #[derive(Clone)]
 struct FakeRegistry {
     urls: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
-    requests: Arc<Mutex<Vec<String>>>,
+    requests: Arc<Mutex<Vec<(String, Vec<(String, String)>)>>>,
 }
 
 impl FakeRegistry {
     fn publish(pkgs: &[Pkg]) -> Self {
+        Self::publish_at("https://fake", pkgs)
+    }
+
+    /// Publish under a registry base URL; packuments and tarballs both live under it.
+    fn publish_at(base: &str, pkgs: &[Pkg]) -> Self {
         let mut urls = BTreeMap::new();
         let mut packuments: BTreeMap<&str, (Vec<serde_json::Value>, &str)> = BTreeMap::new();
         for p in pkgs {
-            let tarball_url = format!("https://fake/{}/-/{}.tgz", p.name, p.version);
+            let tarball_url = format!("{base}/{}/-/{}.tgz", p.name, p.version);
             let tgz = tarball(p);
             let integrity = format!(
                 "sha512-{}",
@@ -74,7 +79,7 @@ impl FakeRegistry {
             let doc =
                 serde_json::json!({ "dist-tags": { "latest": latest }, "versions": versions });
             urls.insert(
-                format!("https://fake/{}", name.replace('/', "%2f")),
+                format!("{base}/{}", name.replace('/', "%2f")),
                 serde_json::to_vec(&doc).unwrap(),
             );
         }
@@ -94,14 +99,21 @@ impl FakeRegistry {
             .lock()
             .unwrap()
             .iter()
-            .filter(|u| !u.ends_with(".tgz"))
+            .filter(|(u, _)| !u.ends_with(".tgz"))
             .count()
     }
 }
 
 impl Transport for FakeRegistry {
-    fn get(&self, url: &str, _accept: &str) -> Result<Vec<u8>, Error> {
-        self.requests.lock().unwrap().push(url.to_string());
+    fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<Vec<u8>, Error> {
+        let headers = headers
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        self.requests
+            .lock()
+            .unwrap()
+            .push((url.to_string(), headers));
         self.urls
             .lock()
             .unwrap()
@@ -320,6 +332,34 @@ fn reinstall_at_another_version_replaces_the_directory() {
     );
     let third = m.install("tool@2", dir.path()).unwrap();
     assert_eq!(third.packages, 0, "a satisfied request fetches nothing");
+}
+
+#[test]
+fn npmrc_scoped_registry_and_credentials_apply_by_url_prefix() {
+    let reg = FakeRegistry::publish_at("https://acme.io/npm", &[pkg("@acme/tool", "1.0.0")]);
+    let dir = tempdir();
+    let m = microbe(&reg)
+        .npmrc_contents(
+            "@acme:registry=https://acme.io/npm/\n//acme.io/npm/:_authToken=tok\n//elsewhere.io/:_authToken=nope\n",
+        )
+        .unwrap();
+    m.install("@acme/tool", dir.path()).unwrap();
+    let requests = reg.requests.lock().unwrap().clone();
+    assert_eq!(requests[0].0, "https://acme.io/npm/@acme%2ftool");
+    for (url, headers) in &requests {
+        let auth = headers.iter().find(|(k, _)| k == "authorization");
+        assert_eq!(auth.map(|(_, v)| v.as_str()), Some("Bearer tok"), "{url}");
+    }
+    // The default registry carries no credential: its prefix matches nothing configured.
+    let plain = FakeRegistry::publish(&[pkg("plain", "1.0.0")]);
+    microbe(&plain)
+        .npmrc_contents("//elsewhere.io/:_authToken=nope\n")
+        .unwrap()
+        .install("plain", tempdir().path())
+        .unwrap();
+    for (url, headers) in plain.requests.lock().unwrap().iter() {
+        assert!(!headers.iter().any(|(k, _)| k == "authorization"), "{url}");
+    }
 }
 
 #[test]

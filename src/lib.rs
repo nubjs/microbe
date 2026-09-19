@@ -27,6 +27,7 @@
 
 mod error;
 mod extract;
+mod npmrc;
 pub mod registry;
 pub mod transport;
 
@@ -47,6 +48,10 @@ const DEFAULT_CONCURRENCY: usize = 16;
 pub struct Microbe {
     transport: Box<dyn Transport>,
     registry: String,
+    /// `@scope` → registry URL.
+    scoped: BTreeMap<String, String>,
+    /// `(URL prefix, Authorization value)`; the longest matching prefix wins.
+    auth: Vec<(String, String)>,
     concurrency: usize,
     packuments: Mutex<HashMap<String, Packument>>,
 }
@@ -103,6 +108,8 @@ impl Microbe {
         Microbe {
             transport,
             registry: DEFAULT_REGISTRY.to_string(),
+            scoped: BTreeMap::new(),
+            auth: Vec::new(),
             concurrency: DEFAULT_CONCURRENCY,
             packuments: Mutex::new(HashMap::new()),
         }
@@ -111,6 +118,26 @@ impl Microbe {
     pub fn registry(mut self, url: &str) -> Self {
         self.registry = url.trim_end_matches('/').to_string();
         self
+    }
+
+    /// Apply an `.npmrc` at an EXPLICIT path: `registry`, `@scope:registry`, and credentials
+    /// (`_authToken`, `_auth`, `username` with `_password`) keyed by URL prefix, as npm keys
+    /// them. Nothing is discovered, and `${VAR}` is not expanded — resolve it and use
+    /// [`Microbe::npmrc_contents`].
+    pub fn npmrc(self, path: &Path) -> Result<Self, Error> {
+        let contents = std::fs::read_to_string(path)?;
+        self.npmrc_contents(&contents)
+    }
+
+    /// [`Microbe::npmrc`] for contents the embedder already holds.
+    pub fn npmrc_contents(mut self, contents: &str) -> Result<Self, Error> {
+        let rc = npmrc::parse(contents)?;
+        if let Some(registry) = rc.registry {
+            self.registry = registry;
+        }
+        self.scoped.extend(rc.scoped);
+        self.auth.extend(rc.auth);
+        Ok(self)
     }
 
     /// Simultaneous registry requests, for both packuments and tarballs.
@@ -342,9 +369,7 @@ impl Microbe {
     }
 
     fn fetch_one(&self, p: &Planned) -> Result<(), Error> {
-        let tgz = self
-            .transport
-            .get(&p.manifest.dist.tarball, "application/octet-stream")?;
+        let tgz = self.fetch(&p.manifest.dist.tarball, "application/octet-stream")?;
         extract::verify(&tgz, &p.manifest.dist, &p.name, &p.version)?;
         extract::extract(&tgz, &p.dir)
     }
@@ -389,9 +414,33 @@ impl Microbe {
     }
 
     fn fetch_packument(&self, name: &str) -> Result<Packument, Error> {
-        let url = format!("{}/{}", self.registry, name.replace('/', "%2f"));
-        let body = self.transport.get(&url, ABBREVIATED)?;
+        let url = format!("{}/{}", self.registry_for(name), name.replace('/', "%2f"));
+        let body = self.fetch(&url, ABBREVIATED)?;
         registry::parse(name, &body)
+    }
+
+    fn registry_for(&self, name: &str) -> &str {
+        name.starts_with('@')
+            .then(|| name.split('/').next())
+            .flatten()
+            .and_then(|scope| self.scoped.get(scope))
+            .map_or(self.registry.as_str(), String::as_str)
+    }
+
+    /// Every request goes through here: the `accept` header, plus the credential whose URL
+    /// prefix is the longest match for `url`, if any.
+    fn fetch(&self, url: &str, accept: &str) -> Result<Vec<u8>, Error> {
+        let nerf = npmrc::nerf(url);
+        let mut headers = vec![("accept", accept)];
+        if let Some((_, value)) = self
+            .auth
+            .iter()
+            .filter(|(prefix, _)| nerf.starts_with(prefix.as_str()))
+            .max_by_key(|(prefix, _)| prefix.len())
+        {
+            headers.push(("authorization", value.as_str()));
+        }
+        self.transport.get(url, &headers)
     }
 
     fn manifest_for(&self, name: &str, version: &str) -> Result<Manifest, Error> {
