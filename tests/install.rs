@@ -35,9 +35,12 @@ const fn pkg(name: &'static str, version: &'static str) -> Pkg {
 }
 
 #[derive(Clone)]
+/// A URL and the headers sent with it.
+type Request = (String, Vec<(String, String)>);
+
 struct FakeRegistry {
     urls: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
-    requests: Arc<Mutex<Vec<(String, Vec<(String, String)>)>>>,
+    requests: Arc<Mutex<Vec<Request>>>,
 }
 
 impl FakeRegistry {

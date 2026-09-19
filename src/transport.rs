@@ -524,7 +524,9 @@ mod tests {
     fn node_transport_reports_http_status() {
         let Some(t) = NodeFetch::spawn() else { return };
         // A URL no resolver answers fails at fetch, not with a status.
-        let err = t.get("https://registry.invalid/x", "*/*").unwrap_err();
+        let err = t
+            .get("https://registry.invalid/x", &[("accept", "*/*")])
+            .unwrap_err();
         assert!(matches!(err, Error::Transport(_)), "{err}");
     }
 }
