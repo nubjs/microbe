@@ -12,6 +12,8 @@ pub enum Error {
         url: String,
         status: u16,
     },
+    /// A consumed `.npmrc` key that cannot be used as written.
+    Npmrc(String),
     /// The packument could not be parsed.
     Registry {
         name: String,
@@ -42,6 +44,7 @@ impl fmt::Display for Error {
             ),
             Error::Transport(detail) => write!(f, "transport: {detail}"),
             Error::Status { url, status } => write!(f, "HTTP {status} for {url}"),
+            Error::Npmrc(detail) => write!(f, "npmrc: {detail}"),
             Error::Registry { name, detail } => {
                 write!(f, "unreadable packument for {name}: {detail}")
             }

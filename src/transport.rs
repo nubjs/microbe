@@ -31,8 +31,9 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
 pub trait Transport: Send + Sync {
-    /// Fetch `url` with the given `Accept` header. A non-2xx status is an error.
-    fn get(&self, url: &str, accept: &str) -> Result<Vec<u8>, Error>;
+    /// Fetch `url` sending `headers` (always an `accept`, sometimes an `authorization`).
+    /// A non-2xx status is an error.
+    fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<Vec<u8>, Error>;
 }
 
 /// The first transport available, in the order documented above.
@@ -95,10 +96,10 @@ if (typeof fetch !== 'function') { process.stdout.write('NOFETCH\n'); process.ex
 process.stdout.write('READY\n');
 const rl = require('readline').createInterface({ input: process.stdin });
 rl.on('line', async (line) => {
-  const [id, accept, url] = line.split('\t');
+  const [id, headers, url] = line.split('\t');
   let status = 0, body = Buffer.alloc(0);
   try {
-    const r = await fetch(url, { headers: { accept } });
+    const r = await fetch(url, { headers: Object.fromEntries(JSON.parse(headers)) });
     status = r.status; body = Buffer.from(await r.arrayBuffer());
   } catch (e) {}
   process.stdout.write(Buffer.concat([Buffer.from(id + ' ' + status + ' ' + body.length + '\n'), body]));
@@ -181,14 +182,18 @@ impl NodeFetch {
 }
 
 impl Transport for NodeFetch {
-    fn get(&self, url: &str, accept: &str) -> Result<Vec<u8>, Error> {
+    fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<Vec<u8>, Error> {
         let poisoned = || Error::Transport("node transport poisoned".into());
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = std::sync::mpsc::channel();
         self.pending.lock().map_err(|_| poisoned())?.insert(id, tx);
         {
             let mut stdin = self.stdin.lock().map_err(|_| poisoned())?;
-            writeln!(stdin, "{id}\t{accept}\t{url}")
+            // Headers travel as a JSON array of pairs; JSON escapes any tab, so the line
+            // still splits on the two literal ones.
+            let headers = serde_json::to_string(headers)
+                .map_err(|e| Error::Transport(format!("node: {e}")))?;
+            writeln!(stdin, "{id}\t{headers}\t{url}")
                 .map_err(|e| Error::Transport(format!("node: {e}")))?;
         }
         let (status, body) = rx
@@ -219,8 +224,8 @@ pub struct Curl;
 
 /// `-w` appends the status after the body, split back off in `get`; `--proto` and
 /// `--proto-redir` pin both the request and any redirect to HTTPS.
-fn curl_args(url: &str, accept: &str) -> Vec<String> {
-    [
+fn curl_args(url: &str, headers: &[(&str, &str)]) -> Vec<String> {
+    let mut args: Vec<String> = [
         "-fsSL",
         "--compressed",
         "--proto",
@@ -229,33 +234,34 @@ fn curl_args(url: &str, accept: &str) -> Vec<String> {
         "=https",
         "-w",
         "\n%{http_code}",
-        "-H",
-        &format!("accept: {accept}"),
-        url,
     ]
     .into_iter()
     .map(String::from)
-    .collect()
+    .collect();
+    for (k, v) in headers {
+        args.push("-H".into());
+        args.push(format!("{k}: {v}"));
+    }
+    args.push(url.into());
+    args
 }
 
-fn wget_args(url: &str, accept: &str) -> Vec<String> {
-    [
-        "-q",
-        "--https-only",
-        "-O",
-        "-",
-        &format!("--header=accept: {accept}"),
-        url,
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect()
+fn wget_args(url: &str, headers: &[(&str, &str)]) -> Vec<String> {
+    let mut args: Vec<String> = ["-q", "--https-only", "-O", "-"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    for (k, v) in headers {
+        args.push(format!("--header={k}: {v}"));
+    }
+    args.push(url.into());
+    args
 }
 
 impl Transport for Curl {
-    fn get(&self, url: &str, accept: &str) -> Result<Vec<u8>, Error> {
+    fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<Vec<u8>, Error> {
         let out = Command::new("curl")
-            .args(curl_args(url, accept))
+            .args(curl_args(url, headers))
             .stdin(Stdio::null())
             .output()
             .map_err(|e| Error::Transport(format!("curl: {e}")))?;
@@ -279,9 +285,9 @@ impl Transport for Curl {
 pub struct Wget;
 
 impl Transport for Wget {
-    fn get(&self, url: &str, accept: &str) -> Result<Vec<u8>, Error> {
+    fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<Vec<u8>, Error> {
         let out = Command::new("wget")
-            .args(wget_args(url, accept))
+            .args(wget_args(url, headers))
             .stdin(Stdio::null())
             .output()
             .map_err(|e| Error::Transport(format!("wget: {e}")))?;
@@ -304,8 +310,8 @@ impl Transport for Wget {
 pub struct Python;
 
 const PYTHON_SCRIPT: &str = r#"
-import sys, urllib.request, urllib.error
-url, accept = sys.argv[1], sys.argv[2]
+import sys, json, urllib.request, urllib.error
+url, headers = sys.argv[1], dict(json.loads(sys.argv[2]))
 class HttpsOnly(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         if not newurl.startswith("https://"):
@@ -313,7 +319,7 @@ class HttpsOnly(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 opener = urllib.request.build_opener(HttpsOnly())
 try:
-    with opener.open(urllib.request.Request(url, headers={"accept": accept})) as r:
+    with opener.open(urllib.request.Request(url, headers=headers)) as r:
         sys.stdout.buffer.write(r.read())
 except urllib.error.HTTPError as e:
     sys.stderr.write(str(e.code))
@@ -321,9 +327,11 @@ except urllib.error.HTTPError as e:
 "#;
 
 impl Transport for Python {
-    fn get(&self, url: &str, accept: &str) -> Result<Vec<u8>, Error> {
+    fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<Vec<u8>, Error> {
+        let headers = serde_json::to_string(headers)
+            .map_err(|e| Error::Transport(format!("python3: {e}")))?;
         let out = Command::new("python3")
-            .args(["-c", PYTHON_SCRIPT, url, accept])
+            .args(["-c", PYTHON_SCRIPT, url, &headers])
             .stdin(Stdio::null())
             .output()
             .map_err(|e| Error::Transport(format!("python3: {e}")))?;
@@ -374,13 +382,12 @@ mod builtin {
     }
 
     impl Transport for Builtin {
-        fn get(&self, url: &str, accept: &str) -> Result<Vec<u8>, Error> {
-            let mut resp = self
-                .0
-                .get(url)
-                .header("accept", accept)
-                .call()
-                .map_err(|e| Error::Transport(e.to_string()))?;
+        fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<Vec<u8>, Error> {
+            let mut req = self.0.get(url);
+            for (k, v) in headers {
+                req = req.header(*k, *v);
+            }
+            let mut resp = req.call().map_err(|e| Error::Transport(e.to_string()))?;
             check_status(url, resp.status().as_u16())?;
             resp.body_mut()
                 .with_config()
@@ -397,14 +404,16 @@ mod tests {
 
     #[test]
     fn host_clients_refuse_to_leave_https() {
-        let curl = curl_args("https://r/x", "*/*");
+        let curl = curl_args("https://r/x", &[("accept", "*/*")]);
         let proto = curl.iter().position(|a| a == "--proto").unwrap();
         let redir = curl.iter().position(|a| a == "--proto-redir").unwrap();
         assert_eq!(
             (&curl[proto + 1], &curl[redir + 1]),
             (&"=https".into(), &"=https".into())
         );
-        assert!(wget_args("https://r/x", "*/*").contains(&"--https-only".to_string()));
+        assert!(
+            wget_args("https://r/x", &[("accept", "*/*")]).contains(&"--https-only".to_string())
+        );
         assert!(PYTHON_SCRIPT.contains("redirect off https refused"));
     }
 
@@ -416,12 +425,18 @@ mod tests {
         let port = barrier_server();
         assert_eq!(
             Python
-                .get(&format!("http://127.0.0.1:{port}/fast"), "*/*")
+                .get(
+                    &format!("http://127.0.0.1:{port}/fast"),
+                    &[("accept", "*/*")]
+                )
                 .unwrap(),
             b"fast-body"
         );
         let err = Python
-            .get(&format!("http://127.0.0.1:{port}/missing"), "*/*")
+            .get(
+                &format!("http://127.0.0.1:{port}/missing"),
+                &[("accept", "*/*")],
+            )
             .unwrap_err();
         assert!(matches!(err, Error::Status { status: 404, .. }), "{err}");
     }
@@ -485,11 +500,21 @@ mod tests {
         let Some(t) = NodeFetch::spawn() else { return };
         let port = barrier_server();
         std::thread::scope(|s| {
-            let slow = s.spawn(|| t.get(&format!("http://127.0.0.1:{port}/slow"), "*/*"));
+            let slow = s.spawn(|| {
+                t.get(
+                    &format!("http://127.0.0.1:{port}/slow"),
+                    &[("accept", "*/*")],
+                )
+            });
             // Give `/slow` a head start so it is in flight first; correctness does not
             // depend on this, only the strength of the check does.
             std::thread::sleep(std::time::Duration::from_millis(200));
-            let fast = s.spawn(|| t.get(&format!("http://127.0.0.1:{port}/fast"), "*/*"));
+            let fast = s.spawn(|| {
+                t.get(
+                    &format!("http://127.0.0.1:{port}/fast"),
+                    &[("accept", "*/*")],
+                )
+            });
             assert_eq!(fast.join().unwrap().unwrap(), b"fast-body");
             assert_eq!(slow.join().unwrap().unwrap(), b"slow-body");
         });
@@ -499,7 +524,9 @@ mod tests {
     fn node_transport_reports_http_status() {
         let Some(t) = NodeFetch::spawn() else { return };
         // A URL no resolver answers fails at fetch, not with a status.
-        let err = t.get("https://registry.invalid/x", "*/*").unwrap_err();
+        let err = t
+            .get("https://registry.invalid/x", &[("accept", "*/*")])
+            .unwrap_err();
         assert!(matches!(err, Error::Transport(_)), "{err}");
     }
 }
