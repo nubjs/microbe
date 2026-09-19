@@ -3,12 +3,12 @@
 # a directory the caller names, verifies integrity, and reports the bin entries. Nothing
 # else: no lockfile, no node_modules reconciliation, no lifecycle scripts, no store.
 #
-# Size budget: under 1 MB stripped, and every default build clears it — 542 KB on
-# darwin-arm64, 679 KB on linux-gnu, 690 KB static on linux-musl (opt-level "z" + fat
-# LTO, measured 2026-09-19). TLS is the entire budget: `--features tls` costs about
-# 1.1 MB, which fits on macOS/Windows platform TLS (837 KB total) and does not on Linux
-# (1.76 MB). Hence in-binary TLS is opt-in and the default build reaches the network
-# through a client the host already has — see src/transport.rs.
+# Size budget: under 1 MB stripped, and CI fails if a default build reaches it. Measured
+# 2026-09-19 (opt-level "z" + fat LTO): 853 KB on darwin-arm64 and 784 KB on win32-x64,
+# both with the platform TLS always linked; 682 KB on linux-x64 with no TLS at all, because
+# rustls would cost about 1.1 MB there. Hence on Linux in-binary TLS is opt-in
+# (`--features tls`) and the default build reaches the network through a client the host
+# already has — see src/transport.rs.
 [package]
 name = "microbe"
 version = "0.0.0"
