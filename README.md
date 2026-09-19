@@ -20,15 +20,15 @@ microbe is an embedder-facing tool, not a human CLI, so it never guesses. The ta
 
 ## Size
 
-Stripped, `opt-level = "z"` with fat LTO:
+Stripped, `opt-level = "z"` with fat LTO, measured by CI on 2026-09-19 with the stable toolchain:
 
-| Target | default | `--features tls` |
+| Target | default build | TLS in it |
 | --- | --- | --- |
-| aarch64-apple-darwin | 542 KB | 837 KB |
-| x86_64-unknown-linux-gnu | 679 KB | 1.76 MB |
-| x86_64-unknown-linux-musl (static) | 690 KB | 1.75 MB |
+| aarch64-apple-darwin | 853 KB | Security.framework, always |
+| x86_64-pc-windows-msvc | 784 KB | SChannel, always |
+| x86_64-unknown-linux-gnu | 682 KB | none; `--features tls` adds rustls for about 1.1 MB |
 
-The budget is decided by TLS and nothing else. The default build links none: it borrows an HTTPS client the host already has, so the resolve, verify, and extract core is all that remains, and even a fully static musl binary stays well under a megabyte. Turning on `tls` adds a real client — platform TLS on macOS and Windows, rustls and ring elsewhere, where it costs about 1.1 MB and takes a Linux binary over budget.
+The budget is decided by TLS and nothing else. The resolve, verify and extract core is about 60 KB of code. On macOS and Windows the operating system's TLS is reachable through Rust bindings for about 300 KB, with no C compiled and no process spawned, so it is always in. On Linux there is no system TLS to bind to, a rustls stack costs about 1.1 MB, and so the Linux build links none by default and borrows an HTTPS client the host already has. The CI size job fails if any default build reaches 1 MB.
 
 ## Speed
 
@@ -48,13 +48,14 @@ Two phases. The plan phase walks the dependency graph breadth-first, fetching ea
 Microbe::with_transport(MyClient::new())
 ```
 
-Otherwise `Microbe::new()` detects one, preferring in-binary TLS when compiled, then:
+Otherwise `Microbe::new()` uses the in-binary client on macOS and Windows, or on Linux when built with `--features tls`. A Linux build without it tries, in order:
 
 1. **`node`** — one long-lived child running `fetch`, with requests multiplexed over its stdio so the parallel install actually runs in parallel and undici reuses connections. This is the anchor, because whatever gets installed is about to be run by Node anyway.
-2. **`curl`** — macOS, Windows 10 and later, most full Linux distributions.
+2. **`curl`** — most full Linux distributions.
 3. **`wget`** — busybox, so Alpine.
+4. **`python3`** — the Python container images, which carry neither `curl` nor `wget` but do carry Python with its `ssl` module and a CA bundle.
 
-**The default build requires one of those three programs on `PATH`, or a `Transport` supplied by the embedder.** Node comes first because it is the only one of the three the use case guarantees. A survey of 16 popular container base images found `curl` on 4 of them, and 8 carried neither `curl` nor `wget`; every Node image carries Node.
+**The default Linux build requires one of those four programs on `PATH`, or a `Transport` supplied by the embedder.** Node comes first because it is the only one the use case guarantees. A survey of 16 popular container base images found `curl` on 4 of them, and 8 carried neither `curl` nor `wget`; every Node image carries Node. The Debian and Ubuntu slim images carry none of the four and no CA bundle either, so on those the answer is `--features tls` or an embedder-supplied `Transport`. Every host client is told to refuse a redirect off HTTPS: a tarball is protected by its integrity hash, but a packument is not.
 
 ## What it implements
 

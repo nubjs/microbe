@@ -20,13 +20,19 @@ jobs:
       - run: cargo clippy --locked --all-targets --features tls -- -D warnings
       - run: cargo test --locked
   size:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --locked --release
       - name: Default build stays under 1 MB
+        shell: bash
         run: |
-          size=$(stat -c %s target/release/microbe)
-          echo "microbe: $size bytes"
+          for f in target/release/microbe target/release/microbe.exe; do [ -f "$f" ] && bin=$f; done
+          size=$(wc -c < "$bin" | tr -d " ")
+          echo "$bin: $size bytes"
           test "$size" -lt 1000000
