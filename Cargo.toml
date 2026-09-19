@@ -23,7 +23,7 @@ default = []
 # In-binary TLS on Linux, through rustls, where it costs about 1 MB and so is opt-in. On
 # macOS and Windows the platform TLS (Security.framework / SChannel) is always linked — about
 # 300 KB, no C compiled, no process spawned — and this feature changes nothing.
-tls = ["dep:ureq-rustls"]
+tls = ["dep:ureq"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -42,7 +42,7 @@ node-semver = "2"
 ureq = { version = "3", default-features = false, features = ["gzip", "native-tls"] }
 
 [target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.dependencies]
-ureq-rustls = { package = "ureq", version = "3", default-features = false, features = ["gzip", "rustls"], optional = true }
+ureq = { version = "3", default-features = false, features = ["gzip", "rustls"], optional = true }
 
 [[bin]]
 name = "microbe"

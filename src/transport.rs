@@ -346,8 +346,6 @@ impl Transport for Python {
 mod builtin {
     use super::{Transport, check_status};
     use crate::error::Error;
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    use ureq_rustls as ureq;
 
     pub struct Builtin(ureq::Agent);
 
