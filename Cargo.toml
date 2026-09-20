@@ -39,10 +39,11 @@ base64 = "0.22"
 node-semver = "2"
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
-# `native-tls-no-default`, not `native-tls`: the latter bundles Mozilla's roots and hands ONLY
-# those to the platform, which SChannel refuses for a chain ending elsewhere (ureq #1155).
-# The platform trust store is the point of platform TLS, and it ships no root bundle.
-ureq = { version = "3", default-features = false, features = ["gzip", "native-tls-no-default"] }
+# The client is built with `RootCerts::PlatformVerifier`: ureq's default hands the platform
+# ONLY Mozilla's bundle, which SChannel refuses for a chain ending elsewhere (ureq #1155).
+# `native-tls-no-default` would drop that bundle from the binary, but in ureq 3.4.2 every
+# connector gate checks `feature = "native-tls"`, so it compiles no TLS at all.
+ureq = { version = "3", default-features = false, features = ["gzip", "native-tls"] }
 
 [target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.dependencies]
 ureq = { version = "3", default-features = false, features = ["gzip", "rustls"], optional = true }
