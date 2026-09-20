@@ -361,11 +361,12 @@ mod builtin {
         pub fn new() -> Self {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
-                use ureq::tls::{TlsConfig, TlsProvider};
+                use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
                 let cfg = ureq::Agent::config_builder()
                     .tls_config(
                         TlsConfig::builder()
                             .provider(TlsProvider::NativeTls)
+                            .root_certs(RootCerts::PlatformVerifier)
                             .build(),
                     )
                     .http_status_as_error(false)
