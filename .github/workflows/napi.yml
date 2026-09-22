@@ -25,18 +25,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: ${{ matrix.target }}
-      - if: matrix.musl
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
       - name: Build the addon
+        if: ${{ !matrix.musl }}
         working-directory: napi
-        # musl links the C runtime statically by default, and a static runtime cannot go
-        # into a cdylib; the addon alone is built against a dynamic one.
-        env:
-          RUSTFLAGS: ${{ matrix.musl && '-C target-feature=-crt-static' || '' }}
         run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Build the addon on Alpine
+        # A musl cdylib linked on the Ubuntu runner does not load in a musl Node, so the musl
+        # builds link with Alpine's own toolchain. musl links the C runtime statically by
+        # default, and a static runtime cannot go into a cdylib, hence -crt-static.
+        if: matrix.musl
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src/napi \
+            -e RUSTFLAGS='-C target-feature=-crt-static' rust:1-alpine \
+            sh -c 'apk add --no-cache musl-dev >/dev/null && cargo build --locked --release --target ${{ matrix.target }}'
       - name: Package it
         working-directory: napi
         shell: bash
