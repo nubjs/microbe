@@ -1,0 +1,90 @@
+# Builds the `@nubjs/microbe` Node-API addon for every platform package and uploads each
+# package directory as an artifact. Publishing is a separate, deliberate step.
+name: napi
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: darwin-arm64,     runner: macos-latest,      target: aarch64-apple-darwin,        lib: libmicrobe_napi.dylib }
+          - { platform: darwin-x64,       runner: macos-latest,      target: x86_64-apple-darwin,         lib: libmicrobe_napi.dylib }
+          - { platform: linux-x64,        runner: ubuntu-latest,     target: x86_64-unknown-linux-gnu,    lib: libmicrobe_napi.so }
+          - { platform: linux-x64-musl,   runner: ubuntu-latest,     target: x86_64-unknown-linux-musl,   lib: libmicrobe_napi.so, musl: true }
+          - { platform: linux-arm64,      runner: ubuntu-24.04-arm,  target: aarch64-unknown-linux-gnu,   lib: libmicrobe_napi.so }
+          - { platform: linux-arm64-musl, runner: ubuntu-24.04-arm,  target: aarch64-unknown-linux-musl,  lib: libmicrobe_napi.so, musl: true }
+          - { platform: win32-x64,        runner: windows-latest,    target: x86_64-pc-windows-msvc,      lib: microbe_napi.dll }
+          - { platform: win32-arm64,      runner: windows-latest,    target: aarch64-pc-windows-msvc,     lib: microbe_napi.dll }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - name: Build the addon
+        working-directory: napi
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Package it
+        working-directory: napi
+        shell: bash
+        run: node scripts/platform-package.mjs ${{ matrix.platform }} target/${{ matrix.target }}/release/${{ matrix.lib }} dist/${{ matrix.platform }}
+      - name: Load it and install a real package
+        # A cross-built addon cannot load on this runner; the native ones prove the whole path.
+        if: ${{ !contains(matrix.platform, 'musl') && matrix.platform != 'darwin-x64' && matrix.platform != 'win32-arm64' }}
+        working-directory: napi
+        shell: bash
+        run: |
+          cp dist/${{ matrix.platform }}/microbe.${{ matrix.platform }}.node .
+          node -e '
+            const { install, installSync } = require("./index.js");
+            const dir = require("node:path").join(process.env.RUNNER_TEMP, "napi-smoke");
+            const done = installSync(["is-odd@^3"], dir);
+            if (done.roots[0].name !== "is-odd") throw new Error(JSON.stringify(done));
+            install({ typescript: "5" }, dir).then((r) => {
+              if (!r.bins.tsc) throw new Error(JSON.stringify(r));
+              console.log(r.roots.map((x) => x.name + "@" + x.version).join(" "), Object.keys(r.bins));
+            });
+          '
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: microbe-${{ matrix.platform }}
+          path: napi/dist/${{ matrix.platform }}
+          if-no-files-found: error
+
+  # Stages every package on npm through trusted publishing (OIDC, no token anywhere). A
+  # staged version is not installable until a human runs `npm stage approve` with 2FA, so
+  # a stolen push credential can cut a tag and get nothing published. See RELEASING.md.
+  stage:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: npm install -g npm@latest && npm --version
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: napi/dist
+          pattern: microbe-*
+      - name: Stage the platform packages, then the main package
+        working-directory: napi
+        run: |
+          set -euo pipefail
+          for d in dist/microbe-*; do (cd "$d" && npm stage publish --provenance --access public); done
+          cp ../LICENSE .
+          npm stage publish --provenance --access public
