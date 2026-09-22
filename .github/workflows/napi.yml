@@ -32,6 +32,10 @@ jobs:
           node-version: 22
       - name: Build the addon
         working-directory: napi
+        # musl links the C runtime statically by default, and a static runtime cannot go
+        # into a cdylib; the addon alone is built against a dynamic one.
+        env:
+          RUSTFLAGS: ${{ matrix.musl && '-C target-feature=-crt-static' || '' }}
         run: cargo build --locked --release --target ${{ matrix.target }}
       - name: Package it
         working-directory: napi
@@ -39,21 +43,19 @@ jobs:
         run: node scripts/platform-package.mjs ${{ matrix.platform }} target/${{ matrix.target }}/release/${{ matrix.lib }} dist/${{ matrix.platform }}
       - name: Load it and install a real package
         # A cross-built addon cannot load on this runner; the native ones prove the whole path.
-        if: ${{ !contains(matrix.platform, 'musl') && matrix.platform != 'darwin-x64' && matrix.platform != 'win32-arm64' }}
+        if: ${{ !matrix.musl && matrix.platform != 'darwin-x64' && matrix.platform != 'win32-arm64' }}
         working-directory: napi
         shell: bash
         run: |
           cp dist/${{ matrix.platform }}/microbe.${{ matrix.platform }}.node .
-          node -e '
-            const { install, installSync } = require("./index.js");
-            const dir = require("node:path").join(process.env.RUNNER_TEMP, "napi-smoke");
-            const done = installSync(["is-odd@^3"], dir);
-            if (done.roots[0].name !== "is-odd") throw new Error(JSON.stringify(done));
-            install({ typescript: "5" }, dir).then((r) => {
-              if (!r.bins.tsc) throw new Error(JSON.stringify(r));
-              console.log(r.roots.map((x) => x.name + "@" + x.version).join(" "), Object.keys(r.bins));
-            });
-          '
+          node scripts/smoke.cjs
+      - name: Load it and install a real package, on Alpine
+        # The runner's Node is glibc; a musl build loads only in a musl Node.
+        if: matrix.musl
+        working-directory: napi
+        run: |
+          cp dist/${{ matrix.platform }}/microbe.${{ matrix.platform }}.node .
+          docker run --rm -v "$PWD:/napi" node:22-alpine node /napi/scripts/smoke.cjs
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: microbe-${{ matrix.platform }}
