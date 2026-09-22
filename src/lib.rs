@@ -2,8 +2,9 @@
 //! by spec, or a `package.json`-shaped map of names to ranges.
 //!
 //! ```no_run
-//! let installed = microbe::Microbe::new()?.install("esbuild@^0.25", std::path::Path::new("/tmp/x"))?;
-//! println!("{} {} {:?}", installed.name, installed.version, installed.bins);
+//! let done = microbe::Microbe::new()?.install("esbuild@^0.25", std::path::Path::new("/tmp/x"))?;
+//! let root = &done.roots[0];
+//! println!("{}@{} in {} with bins {:?}", root.name, root.version, root.dir.display(), done.bins);
 //! # Ok::<(), microbe::Error>(())
 //! ```
 //!
@@ -17,7 +18,7 @@
 //! Optionality is a property of the GRAPH, not of a package: the plan records every edge, a
 //! package is required when the root reaches it over non-optional edges alone, and a failure
 //! climbs toward the root until an optional edge absorbs it (the branch is dropped, as npm
-//! does) or it reaches something required (the install fails). See [`settle`].
+//! does) or it reaches something required (the install fails).
 //!
 //! What it deliberately does not do: run lifecycle scripts (reported instead, see
 //! [`Installation::skipped_install_scripts`]), honour `peerDependencies`, write a lockfile,
@@ -28,7 +29,7 @@
 mod error;
 mod extract;
 mod npmrc;
-pub mod registry;
+mod registry;
 pub mod transport;
 
 pub use error::Error;
@@ -44,6 +45,11 @@ pub const DEFAULT_REGISTRY: &str = "https://registry.npmjs.org";
 const ABBREVIATED: &str = "application/vnd.npm.install-v1+json";
 /// Matches npm's and pnpm's default network concurrency.
 const DEFAULT_CONCURRENCY: usize = 16;
+const RETRIES: usize = 2;
+const RETRY_BACKOFF: [std::time::Duration; RETRIES] = [
+    std::time::Duration::from_millis(500),
+    std::time::Duration::from_secs(2),
+];
 
 pub struct Microbe {
     transport: Box<dyn Transport>,
@@ -56,37 +62,26 @@ pub struct Microbe {
     packuments: Mutex<HashMap<String, Packument>>,
 }
 
-/// What [`Microbe::install`] produced. `bins` maps each command the package declares to the
-/// absolute path of its script, with the executable bit set; the same commands are linked
-/// under `<dir>/node_modules/.bin`.
+/// What an install produced. [`Microbe::install`] yields exactly one [`Root`].
 #[derive(Debug)]
-pub struct Installed {
-    pub name: String,
-    pub version: String,
-    /// `<dir>/node_modules/<name>`.
-    pub dir: PathBuf,
-    pub bins: BTreeMap<String, PathBuf>,
-    /// Packages extracted, the root included.
-    pub packages: usize,
-    /// `name@version` of every package whose install script was NOT run.
-    pub skipped_install_scripts: Vec<String>,
-}
-
-/// What [`Microbe::install_all`] produced.
-#[derive(Debug)]
+#[non_exhaustive]
 pub struct Installation {
     /// The requested packages, in request order.
     pub roots: Vec<Root>,
     /// Every command linked under `<dir>/node_modules/.bin`, mapped to the absolute path of
-    /// the script it runs. Requested packages win a name clash with a dependency.
+    /// the script it runs, with the executable bit set. Requested packages win a name clash
+    /// with a dependency.
     pub bins: BTreeMap<String, PathBuf>,
-    /// Packages extracted.
+    /// Packages extracted by this call; a package already present at a satisfying version
+    /// is not counted.
     pub packages: usize,
     /// `name@version` of every package whose install script was NOT run.
     pub skipped_install_scripts: Vec<String>,
 }
 
-#[derive(Debug)]
+/// A requested package, as installed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Root {
     pub name: String,
     pub version: String,
@@ -148,22 +143,9 @@ impl Microbe {
 
     /// `spec` is `name`, `name@tag`, `name@version` or `name@range` (`@scope/name@^1` works).
     /// `dir` is created if needed; packages go under `dir/node_modules/`.
-    pub fn install(&self, spec: &str, dir: &Path) -> Result<Installed, Error> {
+    pub fn install(&self, spec: &str, dir: &Path) -> Result<Installation, Error> {
         let (name, range) = split_spec(spec);
-        let mut all = self.install_all([(name, range)], dir)?;
-        let root = all.roots.remove(0);
-        Ok(Installed {
-            bins: all
-                .bins
-                .into_iter()
-                .filter(|(_, path)| path.starts_with(&root.dir))
-                .collect(),
-            name: root.name,
-            version: root.version,
-            dir: root.dir,
-            packages: all.packages,
-            skipped_install_scripts: all.skipped_install_scripts,
-        })
+        self.install_all([(name, range)], dir)
     }
 
     /// Install every `(name, range)` pair — the shape of a `package.json` `dependencies`
@@ -181,7 +163,7 @@ impl Microbe {
             .filter(|(name, _)| seen.insert(*name))
             .collect();
         std::fs::create_dir_all(dir)?;
-        let root = dir.canonicalize()?;
+        let root = canonical(dir)?;
         let mut plan = self.plan(&root, &deps)?;
         let live = self.materialize(&mut plan)?;
         let bins = link_bins(&root, &plan, &live)?;
@@ -440,7 +422,22 @@ impl Microbe {
         {
             headers.push(("authorization", value.as_str()));
         }
-        self.transport.get(url, &headers)
+        // Two retries on a transport failure or a 429 / 5xx, as npm does by default. A 4xx
+        // other than 429 is the registry's final word and is returned at once.
+        let mut attempt = 0;
+        loop {
+            match self.transport.get(url, &headers) {
+                Err(Error::Transport(_))
+                | Err(Error::Status {
+                    status: 429 | 500..=599,
+                    ..
+                }) if attempt < RETRIES => {
+                    std::thread::sleep(RETRY_BACKOFF[attempt]);
+                    attempt += 1;
+                }
+                other => return other,
+            }
+        }
     }
 
     fn manifest_for(&self, name: &str, version: &str) -> Result<Manifest, Error> {
@@ -725,6 +722,21 @@ fn installed_version(pkg_dir: &Path) -> Result<Option<String>, Error> {
         detail: e.to_string(),
     })?;
     Ok(Some(v.version))
+}
+
+/// [`Path::canonicalize`] without the `\\?\` verbatim prefix Windows adds: every path this
+/// crate returns or prints is one a person or another tool can use unchanged.
+fn canonical(dir: &Path) -> Result<PathBuf, Error> {
+    let real = dir.canonicalize()?;
+    if !cfg!(windows) {
+        return Ok(real);
+    }
+    let s = real.to_string_lossy();
+    Ok(match s.strip_prefix(r"\\?\") {
+        Some(rest) if rest.starts_with(r"UNC\") => PathBuf::from(format!(r"\\{}", &rest[4..])),
+        Some(rest) => PathBuf::from(rest),
+        None => real,
+    })
 }
 
 /// `@scope/name@^1` → (`@scope/name`, `^1`); a bare name has an empty range (→ `latest`).

@@ -5,7 +5,7 @@ use base64::Engine;
 use microbe::{Error, Microbe, Transport};
 use sha2::{Digest, Sha512};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// A package to publish into the fake registry.
@@ -181,6 +181,18 @@ fn installed_version(dir: &Path) -> String {
     v["version"].as_str().unwrap().to_string()
 }
 
+/// `<dir>/node_modules` as the crate reports it: canonical, and on Windows without the
+/// `\\?\` prefix the crate strips.
+fn node_modules(dir: &TempDir) -> PathBuf {
+    let real = dir.path().canonicalize().unwrap();
+    let s = real.to_string_lossy();
+    let real = match s.strip_prefix(r"\\?\") {
+        Some(rest) if cfg!(windows) => PathBuf::from(rest),
+        _ => real,
+    };
+    real.join("node_modules")
+}
+
 fn microbe(reg: &FakeRegistry) -> Microbe {
     Microbe::with_transport(reg.clone()).registry("https://fake")
 }
@@ -204,12 +216,15 @@ fn installs_the_tree_flat_and_reports_bins() {
     let installed = microbe(&reg).install("@scope/tool", dir.path()).unwrap();
 
     assert_eq!(
-        (installed.name.as_str(), installed.version.as_str()),
+        (
+            installed.roots[0].name.as_str(),
+            installed.roots[0].version.as_str()
+        ),
         ("@scope/tool", "2.0.0")
     );
     assert_eq!(installed.packages, 3, "root, a, and one shared b");
-    let nm = dir.path().canonicalize().unwrap().join("node_modules");
-    assert_eq!(installed.dir, nm.join("@scope/tool"));
+    let nm = node_modules(&dir);
+    assert_eq!(installed.roots[0].dir, nm.join("@scope/tool"));
     assert_eq!(installed_version(&nm.join("a")), "1.5.0");
     assert_eq!(
         installed_version(&nm.join("b")),
@@ -269,7 +284,7 @@ fn installs_a_package_map_and_links_every_top_level_bin() {
             dir.path(),
         )
         .unwrap();
-    let nm = dir.path().canonicalize().unwrap().join("node_modules");
+    let nm = node_modules(&dir);
     let roots: Vec<(&str, &str)> = all
         .roots
         .iter()
@@ -319,10 +334,10 @@ fn reinstall_at_another_version_replaces_the_directory() {
     let dir = tempdir();
     let m = microbe(&reg);
     m.install("tool@1", dir.path()).unwrap();
-    let nm = dir.path().canonicalize().unwrap().join("node_modules");
+    let nm = node_modules(&dir);
     assert!(nm.join("tool/old.js").is_file());
     let second = m.install("tool@2", dir.path()).unwrap();
-    assert_eq!(second.version, "2.0.0");
+    assert_eq!(second.roots[0].version, "2.0.0");
     assert!(
         !nm.join("tool/old.js").exists(),
         "stale file survived the replacement"
@@ -381,7 +396,7 @@ fn version_conflict_nests_under_the_dependent() {
     ]);
     let dir = tempdir();
     let installed = microbe(&reg).install("root@1.0.0", dir.path()).unwrap();
-    let nm = dir.path().canonicalize().unwrap().join("node_modules");
+    let nm = node_modules(&dir);
     assert_eq!(
         installed_version(&nm.join("dep")),
         "2.0.0",
@@ -419,7 +434,7 @@ fn optional_dependencies_skip_other_platforms_and_tolerate_failure() {
     ]);
     let dir = tempdir();
     let installed = microbe(&reg).install("root", dir.path()).unwrap();
-    let nm = dir.path().canonicalize().unwrap().join("node_modules");
+    let nm = node_modules(&dir);
     assert!(nm.join("native-here").is_dir());
     assert!(
         !nm.join("native-elsewhere").exists(),
@@ -454,7 +469,7 @@ fn optional_dependency_mirrored_into_dependencies_stays_optional() {
     ]);
     let dir = tempdir();
     let installed = microbe(&reg).install("root", dir.path()).unwrap();
-    let nm = dir.path().canonicalize().unwrap().join("node_modules");
+    let nm = node_modules(&dir);
     assert!(
         !nm.join("native-elsewhere").exists(),
         "mirrored optional dependency was installed for the wrong os"
@@ -481,7 +496,7 @@ fn failure_inside_an_optional_subtree_drops_the_branch_not_the_install() {
     ]);
     let dir = tempdir();
     let installed = microbe(&reg).install("root", dir.path()).unwrap();
-    let nm = dir.path().canonicalize().unwrap().join("node_modules");
+    let nm = node_modules(&dir);
     assert!(nm.join("kept").is_dir());
     assert!(!nm.join("opt").exists(), "a broken optional package stayed");
     assert!(
@@ -510,7 +525,7 @@ fn corrupt_tarball_inside_an_optional_subtree_is_cleaned_up() {
     reg.corrupt_tarball("bad", "1.0.0");
     let dir = tempdir();
     let installed = microbe(&reg).install("root", dir.path()).unwrap();
-    let nm = dir.path().canonicalize().unwrap().join("node_modules");
+    let nm = node_modules(&dir);
     for gone in ["opt", "bad", "only-for-opt"] {
         assert!(!nm.join(gone).exists(), "{gone} survived a dropped branch");
     }
@@ -615,6 +630,53 @@ fn unknown_package_and_unsatisfiable_range_are_distinct_errors() {
         microbe(&reg).install("root@^9", dir.path()).unwrap_err(),
         Error::NoVersion { .. }
     ));
+}
+
+/// Answers the first `failures` requests with a 503, then defers to the registry.
+struct Flaky {
+    inner: FakeRegistry,
+    failures: Mutex<usize>,
+}
+
+impl Transport for Flaky {
+    fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<Vec<u8>, Error> {
+        let mut left = self.failures.lock().unwrap();
+        if *left > 0 {
+            *left -= 1;
+            return Err(Error::Status {
+                url: url.to_string(),
+                status: 503,
+            });
+        }
+        self.inner.get(url, headers)
+    }
+}
+
+#[test]
+fn a_503_is_retried_twice_and_a_404_is_not() {
+    let reg = FakeRegistry::publish(&[pkg("root", "1.0.0")]);
+    let flaky = |failures| Flaky {
+        inner: reg.clone(),
+        failures: Mutex::new(failures),
+    };
+    let dir = tempdir();
+    Microbe::with_transport(flaky(2))
+        .registry("https://fake")
+        .install("root", dir.path())
+        .unwrap();
+    let err = Microbe::with_transport(flaky(3))
+        .registry("https://fake")
+        .install("root", tempdir().path())
+        .unwrap_err();
+    assert!(matches!(err, Error::Status { status: 503, .. }), "{err}");
+
+    reg.requests.lock().unwrap().clear();
+    microbe(&reg).install("nope", tempdir().path()).unwrap_err();
+    assert_eq!(
+        reg.requests.lock().unwrap().len(),
+        1,
+        "a 404 is the registry's final word and is not retried"
+    );
 }
 
 struct TempDir(std::path::PathBuf);

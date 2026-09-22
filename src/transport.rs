@@ -20,7 +20,8 @@
 //! integrity hash, but a packument is not, so a downgrade could substitute a tarball and its
 //! hash together. An embedder with its own HTTP client skips all of this by implementing
 //! [`Transport`]. Every transport here is safe to call from many threads at once; the
-//! installer does.
+//! installer does. Every request is bounded by [`TIMEOUT`], npm's default fetch timeout;
+//! the installer retries a transport failure or a 5xx twice before giving up.
 
 use crate::error::Error;
 use std::collections::HashMap;
@@ -29,6 +30,9 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
+
+/// A request never outlives this, so a stalled connection cannot hang an install.
+pub const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 pub trait Transport: Send + Sync {
     /// Fetch `url` sending `headers` (always an `accept`, sometimes an `authorization`).
@@ -92,6 +96,7 @@ fn check_status(url: &str, status: u16) -> Result<(), Error> {
 // waiting caller. Node's undici pool then gives connection reuse for free.
 
 const NODE_SCRIPT: &str = r#"
+const TIMEOUT_MS = 300000;
 if (typeof fetch !== 'function') { process.stdout.write('NOFETCH\n'); process.exit(0); }
 process.stdout.write('READY\n');
 const rl = require('readline').createInterface({ input: process.stdin });
@@ -99,7 +104,7 @@ rl.on('line', async (line) => {
   const [id, headers, url] = line.split('\t');
   let status = 0, body = Buffer.alloc(0);
   try {
-    const r = await fetch(url, { headers: Object.fromEntries(JSON.parse(headers)) });
+    const r = await fetch(url, { headers: Object.fromEntries(JSON.parse(headers)), signal: AbortSignal.timeout(TIMEOUT_MS) });
     status = r.status; body = Buffer.from(await r.arrayBuffer());
   } catch (e) {}
   process.stdout.write(Buffer.concat([Buffer.from(id + ' ' + status + ' ' + body.length + '\n'), body]));
@@ -107,10 +112,13 @@ rl.on('line', async (line) => {
 rl.on('close', () => process.exit(0));
 "#;
 
+/// [`TIMEOUT`] as the host clients take it: whole seconds on their command lines.
+const TIMEOUT_SECS: &str = "300";
+
 type Reply = Result<(u16, Vec<u8>), Error>;
 type Pending = Arc<Mutex<HashMap<u64, Sender<Reply>>>>;
 
-pub struct NodeFetch {
+struct NodeFetch {
     child: Mutex<Child>,
     stdin: Mutex<ChildStdin>,
     pending: Pending,
@@ -119,7 +127,7 @@ pub struct NodeFetch {
 
 impl NodeFetch {
     /// `None` when `node` is absent or predates global `fetch` (Node < 18).
-    pub fn spawn() -> Option<Self> {
+    fn spawn() -> Option<Self> {
         let mut child = Command::new("node")
             .args(["-e", NODE_SCRIPT])
             .stdin(Stdio::piped())
@@ -220,7 +228,7 @@ impl Drop for NodeFetch {
 // curl / wget: one process per request. `--compressed` lets curl negotiate gzip for the
 // packument; wget (busybox included) has no equivalent and fetches identity.
 
-pub struct Curl;
+struct Curl;
 
 /// `-w` appends the status after the body, split back off in `get`; `--proto` and
 /// `--proto-redir` pin both the request and any redirect to HTTPS.
@@ -228,6 +236,8 @@ fn curl_args(url: &str, headers: &[(&str, &str)]) -> Vec<String> {
     let mut args: Vec<String> = [
         "-fsSL",
         "--compressed",
+        "--max-time",
+        TIMEOUT_SECS,
         "--proto",
         "=https",
         "--proto-redir",
@@ -247,7 +257,7 @@ fn curl_args(url: &str, headers: &[(&str, &str)]) -> Vec<String> {
 }
 
 fn wget_args(url: &str, headers: &[(&str, &str)]) -> Vec<String> {
-    let mut args: Vec<String> = ["-q", "--https-only", "-O", "-"]
+    let mut args: Vec<String> = ["-q", "--https-only", "-O", "-", "--timeout", TIMEOUT_SECS]
         .into_iter()
         .map(String::from)
         .collect();
@@ -282,7 +292,7 @@ impl Transport for Curl {
     }
 }
 
-pub struct Wget;
+struct Wget;
 
 impl Transport for Wget {
     fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<Vec<u8>, Error> {
@@ -307,11 +317,11 @@ impl Transport for Wget {
 /// One `python3` process per request, using the standard library's `urllib` and `ssl`.
 /// The body goes to stdout; an HTTP error puts its status on stderr and exits 3; a redirect
 /// off HTTPS is refused.
-pub struct Python;
+struct Python;
 
 const PYTHON_SCRIPT: &str = r#"
 import sys, json, urllib.request, urllib.error
-url, headers = sys.argv[1], dict(json.loads(sys.argv[2]))
+url, headers, timeout = sys.argv[1], dict(json.loads(sys.argv[2])), int(sys.argv[3])
 class HttpsOnly(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         if not newurl.startswith("https://"):
@@ -319,7 +329,7 @@ class HttpsOnly(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 opener = urllib.request.build_opener(HttpsOnly())
 try:
-    with opener.open(urllib.request.Request(url, headers=headers)) as r:
+    with opener.open(urllib.request.Request(url, headers=headers), timeout=timeout) as r:
         sys.stdout.buffer.write(r.read())
 except urllib.error.HTTPError as e:
     sys.stderr.write(str(e.code))
@@ -331,7 +341,7 @@ impl Transport for Python {
         let headers = serde_json::to_string(headers)
             .map_err(|e| Error::Transport(format!("python3: {e}")))?;
         let out = Command::new("python3")
-            .args(["-c", PYTHON_SCRIPT, url, &headers])
+            .args(["-c", PYTHON_SCRIPT, url, &headers, TIMEOUT_SECS])
             .stdin(Stdio::null())
             .output()
             .map_err(|e| Error::Transport(format!("python3: {e}")))?;
@@ -370,6 +380,7 @@ mod builtin {
                             .build(),
                     )
                     .http_status_as_error(false)
+                    .timeout_global(Some(super::TIMEOUT))
                     .build();
                 return Builtin(ureq::Agent::new_with_config(cfg));
             }
@@ -377,6 +388,7 @@ mod builtin {
             Builtin(ureq::Agent::new_with_config(
                 ureq::Agent::config_builder()
                     .http_status_as_error(false)
+                    .timeout_global(Some(super::TIMEOUT))
                     .build(),
             ))
         }

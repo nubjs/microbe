@@ -11,11 +11,15 @@
 # already has — see src/transport.rs.
 [package]
 name = "microbe"
-version = "0.0.0"
+version = "0.1.0-beta.1"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
-publish = false
+repository = "https://github.com/nubjs/microbe"
+readme = "README.md"
+keywords = ["npm", "install", "package-manager", "embeddable", "registry"]
+categories = ["development-tools", "command-line-utilities"]
+exclude = [".github/", "napi/"]
 description = "The smallest embeddable npm package installer: one package and its dependency tree, into a directory."
 
 [features]
