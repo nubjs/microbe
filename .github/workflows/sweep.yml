@@ -10,14 +10,19 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        features: [""]
+        include:
+          # The Linux in-binary TLS build, which nothing else exercises against the registry.
+          - os: ubuntu-latest
+            features: --features tls
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
-      - run: cargo build --locked --release
+      - run: cargo build --locked --release ${{ matrix.features }}
       - name: Install real packages and run their bins
         shell: bash
         run: |
