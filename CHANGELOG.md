@@ -12,4 +12,4 @@ First published version.
 - **Transport**: platform TLS on macOS and Windows through the OS root store; on Linux the first of `node`, `curl`, `wget`, `python3` on the host, or rustls with `--features tls`; every host client refuses a redirect off HTTPS. Requests time out after 300 s and are retried twice on a transport failure or a 429 / 5xx.
 - **CLI** `microbe install [<name[@spec]>...] [--from <file|->] --dir <path> [--registry <url>] [--npmrc <file>]`. Everything explicit: no environment variables, no filesystem walking.
 - **Node-API addon** `@nubjs/microbe` in `napi/`: `install` and `installSync` taking a spec list or a `dependencies` object, with platform packages for eight targets built by the `napi` workflow.
-- **Size**: 702 KB on Linux, 797 KB on Windows, 853 KB on macOS, stripped; CI fails a default build at 1 MB.
+- **Size**: 702 KB on Linux, 800 KB on Windows, 853 KB on macOS, stripped; CI fails a default build at 1 MB.
