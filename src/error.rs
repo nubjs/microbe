@@ -1,6 +1,8 @@
 use std::fmt;
 
+/// Every way an install can fail. More variants may be added in a minor release.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// No transport could be constructed: nothing on the host can speak HTTPS and the crate
     /// was built without in-binary TLS. Carries the list that was tried.
@@ -8,29 +10,18 @@ pub enum Error {
     /// A specific transport exists but failed on a request.
     Transport(String),
     /// The server answered with a non-success status.
-    Status {
-        url: String,
-        status: u16,
-    },
+    Status { url: String, status: u16 },
     /// A consumed `.npmrc` key that cannot be used as written.
     Npmrc(String),
     /// The packument could not be parsed.
-    Registry {
-        name: String,
-        detail: String,
-    },
+    Registry { name: String, detail: String },
     /// No published version satisfies the requested range or tag.
-    NoVersion {
-        name: String,
-        spec: String,
-    },
+    NoVersion { name: String, spec: String },
     /// The downloaded tarball does not match `dist.integrity` / `dist.shasum`.
-    Integrity {
-        name: String,
-        version: String,
-    },
+    Integrity { name: String, version: String },
     /// A tarball entry would escape the package directory.
     UnsafePath(String),
+    /// A filesystem operation failed.
     Io(std::io::Error),
 }
 

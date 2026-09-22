@@ -1,0 +1,36 @@
+# The Node-API addon behind the `@nubjs/microbe` npm package. Its own workspace, not a
+# member of the crate's: a cdylib loaded into the host's Node process must keep
+# `panic = "unwind"` so a panic surfaces as a JS error instead of killing the host, and the
+# root crate's release profile aborts on panic to stay small.
+#
+# On Linux the addon links rustls (`tls`): it runs inside a Node process, so spawning a
+# second `node` for HTTPS would be absurd, and the 1 MB budget is the CLI's, not npm's.
+[workspace]
+
+[package]
+name = "microbe-napi"
+version = "0.1.0-beta.1"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+microbe = { path = ".." }
+napi = { version = "3", default-features = false, features = ["napi8"] }
+napi-derive = "3"
+
+[target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.dependencies]
+microbe = { path = "..", features = ["tls"] }
+
+[build-dependencies]
+napi-build = "2"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
