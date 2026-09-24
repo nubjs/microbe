@@ -24,11 +24,12 @@ try {
 } catch (fromPackage) {
   try {
     native = require(`./microbe.${platform}.node`);
-  } catch {
-    const err = new Error(
-      `@nubjs/microbe has no build for ${platform}. Install failed for @nubjs/microbe-${platform}: ${fromPackage.message}`,
-    );
-    err.cause = fromPackage;
+  } catch (fromFile) {
+    // A build that exists but cannot load is the failure worth reporting; a missing
+    // local file only means this is not a checkout.
+    const cause = fromFile.code === "MODULE_NOT_FOUND" ? fromPackage : fromFile;
+    const err = new Error(`@nubjs/microbe has no build for ${platform}: ${cause.message}`);
+    err.cause = cause;
     throw err;
   }
 }
