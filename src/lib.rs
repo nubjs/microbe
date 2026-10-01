@@ -115,6 +115,26 @@ impl Microbe {
         self
     }
 
+    /// Route packages under `@scope` to `url`, as an `@scope:registry` key does.
+    pub fn scoped_registry(mut self, scope: &str, url: &str) -> Self {
+        let scope = if scope.starts_with('@') {
+            scope.to_string()
+        } else {
+            format!("@{scope}")
+        };
+        self.scoped
+            .insert(scope, url.trim_end_matches('/').to_string());
+        self
+    }
+
+    /// Send `authorization: <value>` with every request whose URL starts with `prefix`,
+    /// given as a URL (`https://npm.acme.dev/`) or in npm's `//npm.acme.dev/` form. The
+    /// longest matching prefix wins. The `.npmrc` credential keys build on this.
+    pub fn auth(mut self, prefix: &str, value: &str) -> Self {
+        self.auth.push((npmrc::prefix(prefix), value.to_string()));
+        self
+    }
+
     /// Apply an `.npmrc` at an EXPLICIT path: `registry`, `@scope:registry`, and credentials
     /// (`_authToken`, `_auth`, `username` with `_password`) keyed by URL prefix, as npm keys
     /// them. Nothing is discovered, and `${VAR}` is not expanded — resolve it and use

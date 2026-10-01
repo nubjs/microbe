@@ -12,7 +12,7 @@ let esbuild = &done.bins["esbuild"]; // /tmp/tools/node_modules/.bin/esbuild -> 
 
 ```
 microbe install <name[@spec]>... --dir <path> [--registry <url>] [--npmrc <file>]
-microbe install --from package.json --dir /tmp/tools    # its `dependencies` map; other keys are ignored
+microbe install-manifest package.json --dir /tmp/tools   # its `dependencies` map; other keys are ignored
 ```
 
 ## From Node
@@ -42,6 +42,8 @@ use microbe::{Microbe, Transport};
 let m = Microbe::new()?                      // in-binary TLS, or the first HTTPS client on the host
     .registry("https://registry.example.com") // default is registry.npmjs.org
     .npmrc(Path::new("/etc/tool/.npmrc"))?    // explicit path only; nothing is discovered
+    .scoped_registry("@acme", "https://npm.acme.dev/")     // what an `@acme:registry` key does
+    .auth("https://npm.acme.dev/", "Bearer tok")           // what a `//npm.acme.dev/:_authToken` key does
     .concurrency(8);                          // parallel fetches; default 16
 
 // One package by spec: `name`, `name@tag`, `name@1.2.3`, `name@^1`, `@scope/name@^1`.
@@ -70,7 +72,7 @@ Microbe is an embedder-facing tool, not a human CLI, so it never guesses. The ta
 
 ## Registry and credentials
 
-An `.npmrc` is applied only from an explicit path (`Microbe::npmrc`, or `--npmrc <file>`), or from contents the embedder already holds (`Microbe::npmrc_contents`). Four keys are read:
+A registry for a scope and a credential for a URL prefix are set directly with `Microbe::scoped_registry` and `Microbe::auth`. An `.npmrc` is a convenience over those two: it is applied only from an explicit path (`Microbe::npmrc`, or `--npmrc <file>`), or from contents the embedder already holds (`Microbe::npmrc_contents`), and four keys are read:
 
 ```ini
 registry=https://registry.example.com
