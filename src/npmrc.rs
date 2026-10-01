@@ -82,6 +82,17 @@ pub fn parse(contents: &str) -> Result<Npmrc, Error> {
     Ok(rc)
 }
 
+/// A caller-given prefix in the same form: scheme dropped, leading `//`, trailing `/`.
+/// Unlike [`nerf`], the path is kept whole, because a prefix is not a request URL.
+pub fn prefix(p: &str) -> String {
+    let rest = p.split_once("://").map_or(p, |(_, r)| r);
+    let mut out = format!("//{}", rest.trim_start_matches('/'));
+    if !out.ends_with('/') {
+        out.push('/');
+    }
+    out
+}
+
 /// The URL-prefix form credentials are keyed by: scheme dropped, query dropped, the path
 /// cut after its last `/`. `https://r.io/@s%2fx?x=1` → `//r.io/`;
 /// `https://r.io/x/-/x-1.tgz` → `//r.io/x/-/`.

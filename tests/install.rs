@@ -354,19 +354,36 @@ fn reinstall_at_another_version_replaces_the_directory() {
 
 #[test]
 fn npmrc_scoped_registry_and_credentials_apply_by_url_prefix() {
-    let reg = FakeRegistry::publish_at("https://acme.io/npm", &[pkg("@acme/tool", "1.0.0")]);
-    let dir = tempdir();
-    let m = microbe(&reg)
-        .npmrc_contents(
-            "@acme:registry=https://acme.io/npm/\n//acme.io/npm/:_authToken=tok\n//elsewhere.io/:_authToken=nope\n",
-        )
-        .unwrap();
-    m.install("@acme/tool", dir.path()).unwrap();
-    let requests = reg.requests.lock().unwrap().clone();
-    assert_eq!(requests[0].0, "https://acme.io/npm/@acme%2ftool");
-    for (url, headers) in &requests {
-        let auth = headers.iter().find(|(k, _)| k == "authorization");
-        assert_eq!(auth.map(|(_, v)| v.as_str()), Some("Bearer tok"), "{url}");
+    // The same routing and credential, once through .npmrc keys and once through the setters
+    // those keys are built on.
+    for setters in [false, true] {
+        let reg = FakeRegistry::publish_at("https://acme.io/npm", &[pkg("@acme/tool", "1.0.0")]);
+        let m = if setters {
+            microbe(&reg)
+                .scoped_registry("@acme", "https://acme.io/npm/")
+                .auth("https://acme.io/npm", "Bearer tok")
+                .auth("//elsewhere.io/", "Bearer nope")
+        } else {
+            microbe(&reg)
+                .npmrc_contents(
+                    "@acme:registry=https://acme.io/npm/\n//acme.io/npm/:_authToken=tok\n//elsewhere.io/:_authToken=nope\n",
+                )
+                .unwrap()
+        };
+        m.install("@acme/tool", tempdir().path()).unwrap();
+        let requests = reg.requests.lock().unwrap().clone();
+        assert_eq!(
+            requests[0].0, "https://acme.io/npm/@acme%2ftool",
+            "setters={setters}"
+        );
+        for (url, headers) in &requests {
+            let auth = headers.iter().find(|(k, _)| k == "authorization");
+            assert_eq!(
+                auth.map(|(_, v)| v.as_str()),
+                Some("Bearer tok"),
+                "{url} setters={setters}"
+            );
+        }
     }
     // The default registry carries no credential: its prefix matches nothing configured.
     let plain = FakeRegistry::publish(&[pkg("plain", "1.0.0")]);
