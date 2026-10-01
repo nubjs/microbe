@@ -42,16 +42,31 @@ jobs:
           run_bin "$RUNNER_TEMP/spec-vite" vite --version
           run_bin "$RUNNER_TEMP/spec-typescript" tsc --version
           run_bin "$RUNNER_TEMP/spec-esbuild" esbuild --version
-          echo "== package map through --from, with an explicit .npmrc"
+          echo "== package map through install-manifest, with an explicit .npmrc"
           d=$RUNNER_TEMP/map
           printf '{"name":"x","dependencies":{"express":"^5","@types/node":"22","is-odd":"^3"},"devDependencies":{"nope":"1"}}' > "$RUNNER_TEMP/package.json"
           printf 'registry=https://registry.npmjs.org/\n//registry.npmjs.org/:_authToken=${NPM_TOKEN}\n' > "$RUNNER_TEMP/bad.npmrc"
-          if "$M" install --from "$RUNNER_TEMP/package.json" --dir "$d" --npmrc "$RUNNER_TEMP/bad.npmrc"; then echo "unexpanded \${VAR} was accepted"; exit 1; fi
+          if "$M" install-manifest "$RUNNER_TEMP/package.json" --dir "$d" --npmrc "$RUNNER_TEMP/bad.npmrc"; then echo "unexpanded \${VAR} was accepted"; exit 1; fi
           printf 'registry=https://registry.npmjs.org/\n' > "$RUNNER_TEMP/ok.npmrc"
-          "$M" install --from "$RUNNER_TEMP/package.json" --dir "$d" --npmrc "$RUNNER_TEMP/ok.npmrc" | head -5
+          "$M" install-manifest "$RUNNER_TEMP/package.json" --dir "$d" --npmrc "$RUNNER_TEMP/ok.npmrc" | head -5
           [ ! -e "$d/node_modules/nope" ]
           node -e "const e=require(require('path').join(process.argv[1],'node_modules','express')); console.log('express', typeof e)" "$d"
           node -e "console.log('is-odd', require(require('path').join(process.argv[1],'node_modules','is-odd'))(3))" "$d"
           test -f "$d/node_modules/@types/node/package.json"
           echo "== a second install over the first fetches nothing"
-          "$M" install --from "$RUNNER_TEMP/package.json" --dir "$d" | grep -x '0 packages'
+          "$M" install-manifest "$RUNNER_TEMP/package.json" --dir "$d" | grep -x '0 packages'
+          echo "== stdin manifest, and the usage errors exit 2 before any network"
+          "$M" install-manifest - --dir "$d" < "$RUNNER_TEMP/package.json" | grep -x '0 packages'
+          usage() { # <expected exit> <args...>
+            local want=$1; shift
+            set +e; "$M" "$@" >/dev/null 2>&1; local got=$?; set -e
+            [ "$got" = "$want" ] || { echo "microbe $* exited $got, expected $want"; exit 1; }
+          }
+          usage 2 install --dir "$RUNNER_TEMP/u"
+          usage 2 install is-odd
+          usage 2 install-manifest --dir "$RUNNER_TEMP/u"
+          usage 2 install-manifest a b --dir "$RUNNER_TEMP/u"
+          usage 2 install --from "$RUNNER_TEMP/package.json" --dir "$RUNNER_TEMP/u"
+          usage 2 frobnicate is-odd --dir "$RUNNER_TEMP/u"
+          printf '{"name":"x"}' > "$RUNNER_TEMP/nodeps.json"
+          usage 1 install-manifest "$RUNNER_TEMP/nodeps.json" --dir "$RUNNER_TEMP/u"
