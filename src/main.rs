@@ -29,6 +29,12 @@ fn main() -> ExitCode {
             "--registry" => registry = args.next(),
             "--dir" => dir = args.next(),
             "--npmrc" => npmrc = args.next(),
+            // `-` alone is stdin; anything else dashed is a flag this binary does not have,
+            // never a package name to look up.
+            _ if a.starts_with('-') && a != "-" => {
+                eprintln!("{USAGE}");
+                return ExitCode::from(2);
+            }
             _ if verb.is_none() => verb = Some(a),
             _ => positionals.push(a),
         }
@@ -107,10 +113,8 @@ fn read_manifest(source: &str) -> Result<Vec<(String, String)>, microbe::Error> 
     struct Manifest {
         dependencies: Option<std::collections::BTreeMap<String, String>>,
     }
-    let bad = |detail: String| microbe::Error::Registry {
-        name: source.to_string(),
-        detail,
-    };
+    let bad =
+        |detail: String| microbe::Error::Io(std::io::Error::other(format!("{source}: {detail}")));
     let manifest: Manifest = serde_json::from_str(&json).map_err(|e| bad(e.to_string()))?;
     let map = manifest
         .dependencies
