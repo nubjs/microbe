@@ -18,6 +18,12 @@ pub struct Options {
     pub npmrc_contents: Option<String>,
     /// Parallel fetches; default 16.
     pub concurrency: Option<u32>,
+    /// Registry per scope, `{ "@acme": "https://npm.acme.dev/" }`: what an `@acme:registry`
+    /// key does.
+    pub scoped_registries: Option<HashMap<String, String>>,
+    /// `authorization` header value per URL prefix, `{ "https://npm.acme.dev/": "Bearer tok" }`:
+    /// what a `//npm.acme.dev/:_authToken` key does. The longest matching prefix wins.
+    pub auth: Option<HashMap<String, String>>,
 }
 
 #[napi(object)]
@@ -73,6 +79,12 @@ fn run(deps: &[(String, String)], dir: &str, opts: &Options) -> Result<Installat
     }
     if let Some(n) = opts.concurrency {
         m = m.concurrency(n as usize);
+    }
+    for (scope, url) in opts.scoped_registries.iter().flatten() {
+        m = m.scoped_registry(scope, url);
+    }
+    for (prefix, value) in opts.auth.iter().flatten() {
+        m = m.auth(prefix, value);
     }
     let done = m
         .install_all(deps.iter().map(|(n, r)| (n.as_str(), r.as_str())), Path::new(dir))

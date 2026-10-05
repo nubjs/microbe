@@ -41,17 +41,15 @@ pub trait Transport: Send + Sync {
 }
 
 /// The first transport available, in the order documented above.
-pub fn detect() -> Result<Box<dyn Transport>, Error> {
+pub(crate) fn detect() -> Result<Box<dyn Transport>, Error> {
     #[cfg(any(feature = "tls", target_os = "macos", target_os = "windows"))]
     return Ok(Box::new(builtin::Builtin::new()));
     #[cfg(not(any(feature = "tls", target_os = "macos", target_os = "windows")))]
     detect_host()
 }
 
-/// The first HOST-provided transport, skipping in-binary TLS even when it is compiled in.
-/// Worth reaching for deliberately behind a TLS-intercepting corporate proxy: the host's own
-/// client carries the system trust store, where a bundled rustls root set does not.
-pub fn detect_host() -> Result<Box<dyn Transport>, Error> {
+/// The first host-provided transport, in the order documented above.
+fn detect_host() -> Result<Box<dyn Transport>, Error> {
     if let Some(t) = NodeFetch::spawn() {
         return Ok(Box::new(t));
     }
