@@ -1,6 +1,6 @@
 # microbe
 
-The smallest embeddable npm package installer. One crate, pure Rust, no async runtime: it fetches packages and their dependency trees from the registry into a directory the caller names, verifies integrity, links the bins, and reports where everything landed.
+The smallest embeddable npm package installer. One crate, pure Rust, no async runtime: it installs a package and its dependency tree into a directory the caller names, verifies integrity, links the bins, and reports where everything landed.
 
 ```rust
 use microbe::Microbe;
@@ -10,19 +10,20 @@ let done = Microbe::new()?.install("esbuild@^0.25", Path::new("/tmp/tools"))?;
 let esbuild = &done.bins["esbuild"]; // /tmp/tools/node_modules/.bin/esbuild -> esbuild/bin/esbuild
 ```
 
-```
-microbe install <name[@spec]>... --dir <path> [--registry <url>] [--npmrc <file>]
+```sh
+microbe install esbuild@^0.25 --dir /tmp/tools
 microbe install-manifest package.json --dir /tmp/tools   # its `dependencies` map; other keys are ignored
 ```
 
-## From Node
+## Install
 
-The same installer is on npm as [`@nubjs/microbe`](napi/README.md), a Node-API addon with the platform builds as optional dependencies:
-
-```js
-import { install } from "@nubjs/microbe";
-const done = await install({ eslint: "^9" }, "/tmp/tools"); // or install(["eslint@^9"], dir)
+```sh
+cargo add microbe                 # the library
+cargo install microbe             # the `microbe` binary
+npm install @nubjs/microbe        # the Node-API addon; the platform build is an optional dependency
 ```
+
+On Linux the library and the binary carry no TLS by default and reach the registry through `node`, `curl`, `wget` or `python3` from the host. A build with `--features tls` carries rustls instead, for about 1.1 MB. The addon always carries TLS. See [How it reaches the network](#how-it-reaches-the-network).
 
 ## Who it is for
 
@@ -30,21 +31,20 @@ Microbe does the `npx`-shaped job for a tool that is not a package manager: inst
 
 It is not a replacement for npm, pnpm or bun in a project checkout. There is no lockfile, no store, no `node_modules` reconciliation, no lifecycle scripts, no workspaces. Those are the parts of a package manager that take up the space, and a host that needs them should call a package manager.
 
-## Status
+## Rust API
 
-Beta. The API is small and settled enough to build on, and CI verifies every change on Linux, macOS and Windows against a real registry. Until 1.0 a minor release may add a field to `Installation`, a variant to `Error`, or a method to `Microbe`; every such type is `#[non_exhaustive]` so that is not a breaking change for a caller. A change that breaks a caller bumps the minor version and is listed in [`CHANGELOG.md`](CHANGELOG.md).
-
-## API
+The whole surface is one builder, one result type, one error type and one trait.
 
 ```rust
-use microbe::{Microbe, Transport};
+use microbe::{Microbe, Transport, DEFAULT_REGISTRY, TIMEOUT};
 
-let m = Microbe::new()?                      // in-binary TLS, or the first HTTPS client on the host
-    .registry("https://registry.example.com") // default is registry.npmjs.org
-    .npmrc(Path::new("/etc/tool/.npmrc"))?    // explicit path only; nothing is discovered
+let m = Microbe::new()?                                    // in-binary TLS, or the first HTTPS client on the host
+    .registry("https://registry.example.com")              // default is DEFAULT_REGISTRY, registry.npmjs.org
     .scoped_registry("@acme", "https://npm.acme.dev/")     // what an `@acme:registry` key does
     .auth("https://npm.acme.dev/", "Bearer tok")           // what a `//npm.acme.dev/:_authToken` key does
-    .concurrency(8);                          // parallel fetches; default 16
+    .npmrc(Path::new("/etc/tool/.npmrc"))?                 // the same, read from an explicit path; nothing is discovered
+    .npmrc_contents("registry=https://r.example.com\n")?   // or from contents the embedder already holds
+    .concurrency(8);                                       // parallel fetches; default 16
 
 // One package by spec: `name`, `name@tag`, `name@1.2.3`, `name@^1`, `@scope/name@^1`.
 let one = m.install("eslint@^9", dir)?;
@@ -55,16 +55,110 @@ many.roots;                    // Vec<Root { name, version, dir }>, in request o
 many.bins;                     // BTreeMap<command, absolute script path>; also linked in node_modules/.bin
 many.packages;                 // tarballs extracted by this call; a package already present is not counted
 many.skipped_install_scripts;  // "name@version" of every package whose install script was not run
+serde_json::to_string(&many)?; // Installation and Root serialize, camel-cased: the shape `--json` prints
 
 // An embedder that already links an HTTP client supplies it and pays for no TLS.
 struct MyClient;
 impl Transport for MyClient {
+    // `headers` always carries an `accept`, and an `authorization` when one is configured.
+    // A non-2xx status is an error; the installer retries on Error::Transport and 429 / 5xx.
     fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<Vec<u8>, microbe::Error> { todo!() }
 }
 let m = Microbe::with_transport(MyClient);
+TIMEOUT;                       // 300 s, the bound every built-in transport puts on one request
 ```
 
 A second install into the same directory fetches only what is missing or at the wrong version. A package about to be installed at another version is removed first, never overlaid.
+
+## Errors
+
+Every failure is one `microbe::Error` variant, and each one displays as a sentence an embedder can show as is.
+
+```rust
+use microbe::Error;
+
+match Microbe::new()?.install("eslint@^9", dir) {
+    Ok(done) => {}
+    Err(Error::NoTransport(tried)) => {}            // nothing on the host speaks HTTPS and the build has no TLS
+    Err(Error::Transport(detail)) => {}             // a request failed after two retries
+    Err(Error::Status { url, status }) => {}        // a non-2xx answer, after retries for 429 and 5xx
+    Err(Error::NoVersion { name, spec }) => {}      // no published version satisfies the range or tag
+    Err(Error::Integrity { name, version }) => {}   // the tarball does not match dist.integrity / dist.shasum
+    Err(Error::UnsafePath(entry)) => {}             // a tarball entry would escape its package directory
+    Err(Error::Registry { name, detail }) => {}     // the packument could not be parsed
+    Err(Error::Npmrc(detail)) => {}                 // a consumed .npmrc key cannot be used as written, such as `${VAR}`
+    Err(Error::Io(e)) => {}                         // a filesystem operation failed
+    Err(_) => {}                                    // the enum is #[non_exhaustive]
+}
+```
+
+An optional dependency never produces an error. When anything under one fails to resolve, download or verify, that branch is dropped and the install succeeds.
+
+## Command line
+
+The binary is the library from a shell. It exists to measure the crate and to try it; it is not a package manager for a project checkout.
+
+```
+usage: microbe install <name[@spec]>... --dir <path> [options]
+       microbe install-manifest <file|-> --dir <path> [options]
+
+options: --registry <url>   registry for unscoped packages; default https://registry.npmjs.org
+         --npmrc <file>     apply this .npmrc; nothing is discovered
+         --json             print the installation as JSON
+```
+
+The `install` verb takes one or more specs. The `install-manifest` verb takes the `dependencies` map of a JSON file, or of stdin for `-`; a whole `package.json` is valid input, and every other key in it is ignored. Both install into `<dir>/node_modules`, and both print one line per requested package, the count of tarballs extracted, and every bin linked:
+
+```
+$ microbe install typescript@5 --dir /tmp/tools
+typescript@5.9.3 -> /tmp/tools/node_modules/typescript
+1 package
+  bin tsc -> /tmp/tools/node_modules/typescript/bin/tsc
+  bin tsserver -> /tmp/tools/node_modules/typescript/bin/tsserver
+```
+
+With `--json` the same installation is printed as one object, the serialized `Installation`:
+
+```json
+{
+  "roots": [{ "name": "typescript", "version": "5.9.3", "dir": "/tmp/tools/node_modules/typescript" }],
+  "bins": {
+    "tsc": "/tmp/tools/node_modules/typescript/bin/tsc",
+    "tsserver": "/tmp/tools/node_modules/typescript/bin/tsserver"
+  },
+  "packages": 1,
+  "skippedInstallScripts": []
+}
+```
+
+| Exit | Meaning |
+| --- | --- |
+| 0 | Installed. |
+| 1 | The install failed; stderr carries `microbe: <error>`. |
+| 2 | Usage error, before any network: no verb, no `--dir`, no spec, a wrong positional count, or a flag the binary does not have. |
+
+## Node API
+
+The same installer is on npm as [`@nubjs/microbe`](napi/README.md), a Node-API addon with the platform builds as optional dependencies. It needs Node 18.19 or later.
+
+```js
+import { install, installSync } from "@nubjs/microbe";
+
+const done = await install({ eslint: "^9", prettier: "3" }, "/tmp/tools", {
+  registry: "https://registry.example.com",                 // default registry.npmjs.org
+  scopedRegistries: { "@acme": "https://npm.acme.dev/" },  // what an `@acme:registry` key does
+  auth: { "https://npm.acme.dev/": "Bearer tok" },         // what a `//npm.acme.dev/:_authToken` key does
+  npmrc: "/etc/tool/.npmrc",                                // the same, from an explicit path; nothing is discovered
+  npmrcContents: "registry=https://r.example.com\n",        // or from contents the host already holds
+  concurrency: 8,                                           // parallel fetches; default 16
+});
+await install(["eslint@^9", "prettier"], dir);              // a spec list works too, and so does installSync
+
+done.roots;                  // [{ name, version, dir }]
+done.bins;                   // { command: absolute script path }, also linked in node_modules/.bin
+done.packages;               // tarballs extracted by this call
+done.skippedInstallScripts;  // "name@version" of every package whose install script was not run
+```
 
 ## Everything is explicit
 
@@ -84,6 +178,32 @@ registry=https://registry.example.com
 ```
 
 Credentials are keyed by URL prefix exactly as npm keys them, and the longest matching prefix wins. A `${VAR}` reference is not expanded, because nothing is read from the environment; a consumed key that still holds one is an error, so a placeholder is never sent as a token.
+
+## How it reaches the network
+
+The in-binary client is used on macOS and Windows, and on Linux when built with `--features tls`. A Linux build without it tries, in order:
+
+1. **`node`** — one long-lived child running `fetch`, with requests multiplexed over its stdio so the parallel install actually runs in parallel and undici reuses connections. This is the anchor, because whatever gets installed is about to be run by Node anyway.
+2. **`curl`** — most full Linux distributions.
+3. **`wget`** — busybox, so Alpine.
+4. **`python3`** — the Python container images, which carry neither `curl` nor `wget` but do carry Python with its `ssl` module and a CA bundle.
+
+**The default Linux build requires one of those four programs on `PATH`, or a `Transport` supplied by the embedder.** A survey of 16 popular container base images found `curl` on 4 of them, and 8 carried neither `curl` nor `wget`; every Node image carries Node. The Debian and Ubuntu slim images carry none of the four and no CA bundle either, so on those the answer is `--features tls` or an embedder-supplied `Transport`.
+
+Every request is bounded by a 300 second timeout, npm's default, and a transport failure or a 429 or 5xx response is retried twice. Every host client is told to refuse a redirect off HTTPS: a tarball is protected by its integrity hash, but a packument is not.
+
+## What it implements
+
+Packages land flat under `<dir>/node_modules`, placed the way Node's resolver expects, and the same request always produces the same tree.
+
+- **Resolution** is first-wins over `dependencies` plus platform-matching `optionalDependencies`, one abbreviated packument fetch per package name. A name listed under `optionalDependencies` is optional even when it also appears under `dependencies`, because `npm publish` mirrors it there.
+- **Placement** is flat; a version conflict nests the loser under its dependent, which is what Node's resolver walks up to find.
+- **Optionality covers the whole branch.** When anything an optional dependency itself requires cannot be resolved or fails its integrity check, that optional dependency is dropped along with every package only it needed, and the install succeeds. A required path reaching the same package fails the install.
+- **Bundled dependencies** ship inside their parent's tarball and are never fetched.
+- **Integrity** is checked against `dist.integrity`, falling back to the pre-SRI `dist.shasum`. A tarball entry whose path would escape its package directory is refused.
+- **Bins** of every requested package are linked under `node_modules/.bin`: a relative symlink on Unix, a `.cmd` shim that runs the script with `node` on Windows. A requested package wins a name clash with a dependency.
+- **Peer dependencies** are ignored.
+- **Install scripts** are not run. Packages that declare one are named in `Installation::skipped_install_scripts` so the caller can decide what that means; for a prebuilt-binary package like esbuild or biome the postinstall is a no-op, because the platform package carrying the binary is an optional dependency that Microbe already installed.
 
 ## Size
 
@@ -107,27 +227,10 @@ Two phases. The plan phase walks the dependency graph breadth-first, fetching ea
 | eslint (77 packages) | 5.7 s | 8.5 s | 8.6 s |
 | vite (16 packages, native binaries) | 27.8 s | 51.5 s | 23.0 s |
 
-## How it reaches the network
+## Status
 
-The in-binary client is used on macOS and Windows, and on Linux when built with `--features tls`. A Linux build without it tries, in order:
-
-1. **`node`** — one long-lived child running `fetch`, with requests multiplexed over its stdio so the parallel install actually runs in parallel and undici reuses connections. This is the anchor, because whatever gets installed is about to be run by Node anyway.
-2. **`curl`** — most full Linux distributions.
-3. **`wget`** — busybox, so Alpine.
-4. **`python3`** — the Python container images, which carry neither `curl` nor `wget` but do carry Python with its `ssl` module and a CA bundle.
-
-**The default Linux build requires one of those four programs on `PATH`, or a `Transport` supplied by the embedder.** A survey of 16 popular container base images found `curl` on 4 of them, and 8 carried neither `curl` nor `wget`; every Node image carries Node. The Debian and Ubuntu slim images carry none of the four and no CA bundle either, so on those the answer is `--features tls` or an embedder-supplied `Transport`.
-
-Every request is bounded by a 300 second timeout, npm's default, and a transport failure or a 429 or 5xx response is retried twice. Every host client is told to refuse a redirect off HTTPS: a tarball is protected by its integrity hash, but a packument is not.
-
-## What it implements
-
-Packages land flat under `<dir>/node_modules`. A version conflict nests the loser under its dependent, which is what Node's resolver walks up to find, and placement is deterministic: the same request always produces the same tree. Resolution is first-wins over `dependencies` plus platform-matching `optionalDependencies`, one abbreviated packument fetch per package name. A name listed under `optionalDependencies` is optional even when it also appears under `dependencies`, because `npm publish` mirrors it there. Optionality covers the whole branch: when anything an optional dependency itself requires cannot be resolved or fails its integrity check, that optional dependency is dropped along with every package only it needed, and the install succeeds, unless a required path reaches the same package, in which case the install fails. A name listed under `bundleDependencies` ships inside its parent's tarball and is never fetched. Tarballs are checked against `dist.integrity`, falling back to the pre-SRI `dist.shasum`. A tarball entry whose path would escape its package directory is refused.
-
-Peer dependencies are ignored and install scripts are not run. Packages that declare one are named in `Installation::skipped_install_scripts` so the caller can decide what that means; for a prebuilt-binary package like esbuild or biome the postinstall is a no-op, because the platform package carrying the binary is an optional dependency that Microbe already installed.
-
-Every command a top-level package declares is linked under `node_modules/.bin`: a relative symlink on Unix, a `.cmd` shim that runs the script with `node` on Windows. A requested package wins a name clash with a dependency.
+Beta. The API is small and settled enough to build on. Until 1.0 a minor release may add a field to `Installation`, a variant to `Error`, or a method to `Microbe`; every such type is `#[non_exhaustive]`, so that is not a breaking change for a caller. A change that breaks a caller bumps the minor version and is listed in [`CHANGELOG.md`](CHANGELOG.md). The crate, the binary and the addon are released together, at one version; [`RELEASING.md`](RELEASING.md) has the procedure.
 
 ## Tests
 
-`cargo test` runs against an in-memory registry serving real gzipped tarballs with real integrity strings, so the whole install path runs with no network. The `Sweep` workflow, run on demand, builds the release binary on Linux, macOS and Windows and installs real packages from the registry with it.
+The test suite runs against an in-memory registry serving real gzipped tarballs with real integrity strings, so the whole install path runs with no network. CI runs it on Linux, macOS and Windows, with clippy, rustfmt, rustdoc and the 1 MB size check. The `Sweep` workflow, run on demand, builds the release binary on Linux, macOS and Windows and installs real packages from the registry with it, and the `napi` workflow builds the addon for its eight platforms and installs a real package through each native one.

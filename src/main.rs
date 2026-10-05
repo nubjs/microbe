@@ -5,6 +5,9 @@
 //!   file, or of stdin for `-`: the `package.json#/dependencies` shape, so a whole
 //!   `package.json` is valid input and every other key is ignored.
 //!
+//! Both print one line per requested package, a package count and the bins, or the whole
+//! [`microbe::Installation`] as JSON with `--json`.
+//!
 //! Everything is explicit: the target directory is required, nothing is read from the
 //! environment, and no file is discovered by walking the filesystem — the embedder decides
 //! where configuration comes from. This is an embedder-facing tool, not a human CLI. The
@@ -13,9 +16,12 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-const USAGE: &str =
-    "usage: microbe install <name[@spec]>... --dir <path> [--registry <url>] [--npmrc <file>]
-       microbe install-manifest <file|-> --dir <path> [--registry <url>] [--npmrc <file>]";
+const USAGE: &str = "usage: microbe install <name[@spec]>... --dir <path> [options]
+       microbe install-manifest <file|-> --dir <path> [options]
+
+options: --registry <url>   registry for unscoped packages; default https://registry.npmjs.org
+         --npmrc <file>     apply this .npmrc; nothing is discovered
+         --json             print the installation as JSON";
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
@@ -24,8 +30,10 @@ fn main() -> ExitCode {
     let mut registry = None;
     let mut npmrc = None;
     let mut verb = None;
+    let mut json = false;
     while let Some(a) = args.next() {
         match a.as_str() {
+            "--json" => json = true,
             "--registry" => registry = args.next(),
             "--dir" => dir = args.next(),
             "--npmrc" => npmrc = args.next(),
@@ -68,11 +76,26 @@ fn main() -> ExitCode {
         )
     };
     match run() {
+        Ok(all) if json => match serde_json::to_string_pretty(&all) {
+            Ok(s) => {
+                println!("{s}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("microbe: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Ok(all) => {
             for r in &all.roots {
                 println!("{}@{} -> {}", r.name, r.version, r.dir.display());
             }
-            println!("{} packages", all.packages);
+            let noun = if all.packages == 1 {
+                "package"
+            } else {
+                "packages"
+            };
+            println!("{} {noun}", all.packages);
             for (cmd, path) in &all.bins {
                 println!("  bin {cmd} -> {}", path.display());
             }

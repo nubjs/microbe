@@ -30,10 +30,16 @@ mod error;
 mod extract;
 mod npmrc;
 mod registry;
-pub mod transport;
+// Builds with in-binary TLS never call the host clients; they stay compiled so every
+// platform type-checks the Linux path.
+#[cfg_attr(
+    any(feature = "tls", target_os = "macos", target_os = "windows"),
+    allow(dead_code)
+)]
+mod transport;
 
 pub use error::Error;
-pub use transport::Transport;
+pub use transport::{TIMEOUT, Transport};
 
 use registry::{Manifest, Packument};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -62,8 +68,10 @@ pub struct Microbe {
     packuments: Mutex<HashMap<String, Packument>>,
 }
 
-/// What an install produced. [`Microbe::install`] yields exactly one [`Root`].
-#[derive(Debug)]
+/// What an install produced. [`Microbe::install`] yields exactly one [`Root`]. Serializes as
+/// camel-cased JSON, the shape `microbe --json` prints and the Node addon returns.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct Installation {
     /// The requested packages, in request order.
@@ -80,7 +88,7 @@ pub struct Installation {
 }
 
 /// A requested package, as installed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[non_exhaustive]
 pub struct Root {
     pub name: String,
@@ -90,7 +98,9 @@ pub struct Root {
 }
 
 impl Microbe {
-    /// Uses the first transport the host provides; see [`transport::detect`].
+    /// Uses in-binary TLS where the build has it (macOS, Windows, Linux with `--features tls`),
+    /// else the first of `node`, `curl`, `wget`, `python3` on the host; [`Error::NoTransport`]
+    /// names them when none is found. [`Microbe::with_transport`] skips the detection.
     pub fn new() -> Result<Self, Error> {
         Ok(Self::from_boxed(transport::detect()?))
     }

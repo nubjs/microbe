@@ -7,6 +7,10 @@ export interface Options {
   npmrcContents?: string;
   /** Parallel fetches; default 16. */
   concurrency?: number;
+  /** Registry per scope, `{ "@acme": "https://npm.acme.dev/" }`: what an `@acme:registry` key does. */
+  scopedRegistries?: Record<string, string>;
+  /** `authorization` header value per URL prefix, `{ "https://npm.acme.dev/": "Bearer tok" }`: what a `//npm.acme.dev/:_authToken` key does. The longest matching prefix wins. */
+  auth?: Record<string, string>;
 }
 
 export interface Root {
