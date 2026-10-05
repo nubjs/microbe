@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0-beta.1 — unreleased
+## 0.1.0-beta.1 — 2026-10-05
 
 First published version.
 
