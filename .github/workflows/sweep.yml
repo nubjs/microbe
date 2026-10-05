@@ -57,6 +57,14 @@ jobs:
           "$M" install-manifest "$RUNNER_TEMP/package.json" --dir "$d" | grep -x '0 packages'
           echo "== stdin manifest, and the usage errors exit 2 before any network"
           "$M" install-manifest - --dir "$d" < "$RUNNER_TEMP/package.json" | grep -x '0 packages'
+          echo "== --json prints the installation"
+          "$M" install typescript@5 --dir "$RUNNER_TEMP/j" --json > "$RUNNER_TEMP/out.json"
+          node -e '
+            const r = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+            const keys = Object.keys(r).sort().join(",");
+            if (keys !== "bins,packages,roots,skippedInstallScripts") throw new Error(keys);
+            if (r.roots[0].name !== "typescript" || r.packages !== 1 || !("tsc" in r.bins)) throw new Error(JSON.stringify(r));
+          ' "$RUNNER_TEMP/out.json"
           usage() { # <expected exit> <args...>
             local want=$1; shift
             set +e; "$M" "$@" >/dev/null 2>&1; local got=$?; set -e
