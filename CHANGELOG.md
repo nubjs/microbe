@@ -14,4 +14,4 @@ First published version.
 - **CLI** `microbe install <name[@spec]>... --dir <path>` and `microbe install-manifest <file|-> --dir <path>`, both with `--registry <url>`, `--npmrc <file>` and `--json`, which prints the installation as one camel-cased object. Everything explicit: no environment variables, no filesystem walking. Exit 2 is a usage error, raised before any network.
 - **Node-API addon** `@nubjs/microbe` in `napi/`: `install` and `installSync` taking a spec list or a `dependencies` object, with `registry`, `scopedRegistries`, `auth`, `npmrc`, `npmrcContents` and `concurrency` options, and platform packages for eight targets built by the `napi` workflow.
 - **Public Rust surface**: `Microbe`, `Installation`, `Root`, `Error`, `Transport`, `TIMEOUT` and `DEFAULT_REGISTRY`. `Installation` and `Root` implement `serde::Serialize`. Transport detection is internal to `Microbe::new`.
-- **Size**: 702 KB on Linux, 800 KB on Windows, 853 KB on macOS, stripped; CI fails a default build at 1 MB.
+- **Size**: 733 KB on Linux, 820 KB on Windows, 886 KB on macOS, stripped; CI fails a default build at 1 MB.

@@ -211,13 +211,13 @@ Packages land flat under `<dir>/node_modules`, placed the way Node's resolver ex
 
 ## Size
 
-Stripped, `opt-level = "z"` with fat LTO, measured by CI on 2026-09-22 with the stable toolchain:
+Stripped, `opt-level = "z"` with fat LTO, measured by CI on 2026-11-09 with the stable toolchain:
 
 | Target | default build | TLS in it |
 | --- | --- | --- |
-| aarch64-apple-darwin | 853 KB | Security.framework, always |
-| x86_64-pc-windows-msvc | 800 KB | SChannel, always |
-| x86_64-unknown-linux-gnu | 702 KB | none; `--features tls` adds rustls for about 1.1 MB |
+| aarch64-apple-darwin | 886 KB | Security.framework, always |
+| x86_64-pc-windows-msvc | 820 KB | SChannel, always |
+| x86_64-unknown-linux-gnu | 733 KB | none; `--features tls` adds rustls for about 1.1 MB |
 
 The budget is decided by TLS and nothing else. The resolve, verify and extract core is about 60 KB of code. On macOS and Windows the operating system's TLS is reachable through Rust bindings for about 300 KB, with no C compiled and no process spawned, so it is always in. On Linux there is no system TLS to bind to, a rustls stack costs about 1.1 MB, and so the Linux build links none by default and borrows an HTTPS client the host already has. The CI size job fails if any default build reaches 1 MB.
 

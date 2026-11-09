@@ -4,8 +4,8 @@
 # else: no lockfile, no node_modules reconciliation, no lifecycle scripts, no store.
 #
 # Size budget: under 1 MB stripped, and CI fails if a default build reaches it. Measured
-# 2026-09-19 (opt-level "z" + fat LTO): 853 KB on darwin-arm64 and 784 KB on win32-x64,
-# both with the platform TLS always linked; 682 KB on linux-x64 with no TLS at all, because
+# 2026-11-09 (opt-level "z" + fat LTO): 886 KB on darwin-arm64 and 820 KB on win32-x64,
+# both with the platform TLS always linked; 733 KB on linux-x64 with no TLS at all, because
 # rustls would cost about 1.1 MB there. Hence on Linux in-binary TLS is opt-in
 # (`--features tls`) and the default build reaches the network through a client the host
 # already has — see src/transport.rs.
