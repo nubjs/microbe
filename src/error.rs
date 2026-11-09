@@ -19,7 +19,7 @@ pub enum Error {
     NoVersion { name: String, spec: String },
     /// The downloaded tarball does not match `dist.integrity` / `dist.shasum`.
     Integrity { name: String, version: String },
-    /// A tarball entry would escape the package directory.
+    /// A tarball entry, or a package name, would land outside `node_modules`.
     UnsafePath(String),
     /// A filesystem operation failed.
     Io(std::io::Error),
@@ -43,7 +43,7 @@ impl fmt::Display for Error {
             Error::Integrity { name, version } => {
                 write!(f, "integrity mismatch for {name}@{version}")
             }
-            Error::UnsafePath(p) => write!(f, "tarball entry escapes the package directory: {p}"),
+            Error::UnsafePath(p) => write!(f, "refusing a path outside the install: {p}"),
             Error::Io(e) => write!(f, "{e}"),
         }
     }

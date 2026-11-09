@@ -13,7 +13,7 @@
 name = "microbe"
 version = "0.1.0-beta.1"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/nubjs/microbe"
 readme = "README.md"
@@ -39,7 +39,7 @@ sha2 = "0.10"
 # Legacy `dist.shasum` for packages published before `integrity` existed.
 sha1 = "0.10"
 base64 = "0.22"
-# Same crate vendor/aube resolves with, so range semantics match nub's own installer.
+# The semver implementation Nub's installer uses, so range semantics match it.
 node-semver = "2"
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]

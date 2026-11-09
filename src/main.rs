@@ -21,7 +21,13 @@ const USAGE: &str = "usage: microbe install <name[@spec]>... --dir <path> [optio
 
 options: --registry <url>   registry for unscoped packages; default https://registry.npmjs.org
          --npmrc <file>     apply this .npmrc; nothing is discovered
-         --json             print the installation as JSON";
+         --json             print the installation as JSON
+         --help, --version";
+
+fn usage() -> ExitCode {
+    eprintln!("{USAGE}");
+    ExitCode::from(2)
+}
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
@@ -33,33 +39,46 @@ fn main() -> ExitCode {
     let mut json = false;
     while let Some(a) = args.next() {
         match a.as_str() {
+            "--help" => {
+                println!("{USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            "--version" => {
+                println!("microbe {}", env!("CARGO_PKG_VERSION"));
+                return ExitCode::SUCCESS;
+            }
             "--json" => json = true,
-            "--registry" => registry = args.next(),
-            "--dir" => dir = args.next(),
-            "--npmrc" => npmrc = args.next(),
+            "--registry" | "--dir" | "--npmrc" => {
+                // A flag with its value missing must not fall back to a default silently.
+                let Some(value) = args.next().filter(|v| !v.starts_with("--")) else {
+                    return usage();
+                };
+                match a.as_str() {
+                    "--registry" => registry = Some(value),
+                    "--dir" => dir = Some(value),
+                    _ => npmrc = Some(value),
+                }
+            }
             // `-` alone is stdin; anything else dashed is a flag this binary does not have,
             // never a package name to look up.
-            _ if a.starts_with('-') && a != "-" => {
-                eprintln!("{USAGE}");
-                return ExitCode::from(2);
-            }
+            _ if a.starts_with('-') && a != "-" => return usage(),
             _ if verb.is_none() => verb = Some(a),
             _ => positionals.push(a),
         }
     }
     let Some(dir) = dir else {
-        eprintln!("{USAGE}");
-        return ExitCode::from(2);
+        return usage();
     };
     let deps = match (verb.as_deref(), positionals.as_slice()) {
-        (Some("install"), specs) if !specs.is_empty() => {
-            Ok(specs.iter().map(|s| split(s)).collect::<Vec<_>>())
-        }
+        (Some("install"), specs) if !specs.is_empty() => Ok(specs
+            .iter()
+            .map(|s| {
+                let (name, range) = microbe::split_spec(s);
+                (name.to_string(), range.to_string())
+            })
+            .collect::<Vec<_>>()),
         (Some("install-manifest"), [source]) => read_manifest(source),
-        _ => {
-            eprintln!("{USAGE}");
-            return ExitCode::from(2);
-        }
+        _ => return usage(),
     };
     let run = || -> Result<microbe::Installation, microbe::Error> {
         let deps = deps?;
@@ -114,30 +133,23 @@ fn main() -> ExitCode {
     }
 }
 
-/// `name[@range]`, split on the last `@` that is not the scope's.
-fn split(spec: &str) -> (String, String) {
-    match spec.rfind('@') {
-        Some(i) if i > 0 => (spec[..i].to_string(), spec[i + 1..].to_string()),
-        _ => (spec.to_string(), String::new()),
-    }
-}
-
 /// The `dependencies` map of a JSON file, or of stdin for `-`. Nothing else in the file is
 /// read: no `devDependencies`, overrides, catalogs, workspaces or `peerDependencies`.
 fn read_manifest(source: &str) -> Result<Vec<(String, String)>, microbe::Error> {
+    let bad =
+        |detail: String| microbe::Error::Io(std::io::Error::other(format!("{source}: {detail}")));
     let json = if source == "-" {
         let mut s = String::new();
-        std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?;
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)
+            .map_err(|e| bad(e.to_string()))?;
         s
     } else {
-        std::fs::read_to_string(source)?
+        std::fs::read_to_string(source).map_err(|e| bad(e.to_string()))?
     };
     #[derive(serde::Deserialize)]
     struct Manifest {
         dependencies: Option<std::collections::BTreeMap<String, String>>,
     }
-    let bad =
-        |detail: String| microbe::Error::Io(std::io::Error::other(format!("{source}: {detail}")));
     let manifest: Manifest = serde_json::from_str(&json).map_err(|e| bad(e.to_string()))?;
     let map = manifest
         .dependencies

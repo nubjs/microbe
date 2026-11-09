@@ -7,6 +7,7 @@ use crate::error::Error;
 use node_semver::{Range, Version};
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::path::Path;
 
 #[derive(Deserialize)]
 pub struct Packument {
@@ -15,7 +16,7 @@ pub struct Packument {
     pub versions: BTreeMap<String, Manifest>,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Clone, Default)]
 pub struct Manifest {
     #[serde(default)]
     pub dependencies: BTreeMap<String, String>,
@@ -32,7 +33,29 @@ pub struct Manifest {
     /// Names shipped inside this package's own tarball, so never fetched separately.
     #[serde(rename = "bundleDependencies", alias = "bundledDependencies", default)]
     pub bundle_dependencies: Bundled,
+    #[serde(default)]
+    pub deprecated: Deprecated,
     pub dist: Dist,
+}
+
+/// npm's deprecation message, or occasionally an empty string or `false` for none.
+#[derive(Deserialize, Clone, Default)]
+#[serde(untagged)]
+pub enum Deprecated {
+    #[default]
+    No,
+    Flag(bool),
+    Message(String),
+}
+
+impl Manifest {
+    fn is_deprecated(&self) -> bool {
+        match &self.deprecated {
+            Deprecated::No => false,
+            Deprecated::Flag(flag) => *flag,
+            Deprecated::Message(message) => !message.is_empty(),
+        }
+    }
 }
 
 /// `bundleDependencies` is a list of names, or `true` meaning every dependency.
@@ -55,7 +78,7 @@ impl Bundled {
     }
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Clone, Default)]
 pub struct Dist {
     pub tarball: String,
     pub integrity: Option<String>,
@@ -92,9 +115,76 @@ pub fn parse(name: &str, body: &[u8]) -> Result<Packument, Error> {
     })
 }
 
-/// Pick the version for `spec`: a dist-tag (`latest` when empty), an exact version, or the
-/// highest version satisfying a range. Versions the range parser rejects are skipped, as npm
-/// does, rather than failing the whole packument.
+/// A package already on disk, from its own `package.json`.
+pub struct Installed {
+    pub name: String,
+    pub version: String,
+    /// Only what a present package still contributes: its bins and whether it has an install
+    /// script. Its dependencies are not read, because the install that wrote it finished.
+    pub manifest: Manifest,
+}
+
+/// What is installed in `dir`. Anything missing or unreadable counts as absent, so that the
+/// directory is replaced instead of failing the install.
+pub fn installed(dir: &Path) -> Option<Installed> {
+    #[derive(Deserialize)]
+    struct PackageJson {
+        name: String,
+        version: String,
+        #[serde(default)]
+        bin: Bin,
+        #[serde(default)]
+        scripts: BTreeMap<String, serde::de::IgnoredAny>,
+    }
+    let raw = std::fs::read(dir.join("package.json")).ok()?;
+    let found: PackageJson = serde_json::from_slice(&raw).ok()?;
+    let lifecycle = ["preinstall", "install", "postinstall"]
+        .iter()
+        .any(|s| found.scripts.contains_key(*s));
+    Some(Installed {
+        name: found.name,
+        version: found.version,
+        manifest: Manifest {
+            bin: found.bin,
+            has_install_script: lifecycle || dir.join("binding.gyp").is_file(),
+            ..Manifest::default()
+        },
+    })
+}
+
+/// `npm:real@range`, the alias form of a dependency spec: the real package and its range.
+pub fn alias(spec: &str) -> Option<(&str, &str)> {
+    spec.strip_prefix("npm:").map(crate::split_spec)
+}
+
+/// Whether `name` is one directory, or a scope and one directory, so that it cannot leave
+/// `node_modules`. The name comes from the registry and is used as a path to delete and
+/// write, so it is checked here rather than trusted; a leading dot also keeps a package off
+/// `.bin`.
+pub fn safe_name(name: &str) -> bool {
+    let part = |p: &str| !p.is_empty() && !p.starts_with('.') && !p.contains(['\\', ':', '\0']);
+    match name.split_once('/') {
+        None => part(name) && !name.starts_with('@'),
+        Some((scope, rest)) => {
+            scope.len() > 1
+                && scope.starts_with('@')
+                && part(scope)
+                && part(rest)
+                && !rest.contains('/')
+        }
+    }
+}
+
+/// Whether `spec` is a semver range, as opposed to a dist-tag.
+pub fn is_range(spec: &str) -> bool {
+    spec.parse::<Range>().is_ok()
+}
+
+/// Pick the version for `spec`: a dist-tag (`latest` when empty), an exact version, or a
+/// range, in npm's order for a range. The `latest` tag wins when the range admits it and it
+/// is not deprecated, so that moving the tag back withdraws a bad release; otherwise the
+/// highest match, preferring one that is not deprecated. Versions the range parser rejects
+/// are skipped, as npm does, rather than failing the whole packument.
 pub fn pick<'a>(
     p: &'a Packument,
     name: &str,
@@ -111,16 +201,28 @@ pub fn pick<'a>(
         spec: spec.to_string(),
     };
     let range: Range = spec.parse().map_err(|_| no_version())?;
-    let mut best: Option<(&str, &Manifest, Version)> = None;
+    if let Some(v) = p.dist_tags.get("latest")
+        && let Some(m) = p.versions.get(v)
+        && !m.is_deprecated()
+        && satisfies(v, spec)
+    {
+        return Ok((v, m));
+    }
+    let mut best: Option<(&str, &Manifest, bool, Version)> = None;
     for (vs, m) in &p.versions {
         let Ok(v) = vs.parse::<Version>() else {
             continue;
         };
-        if range.satisfies(&v) && best.as_ref().is_none_or(|(_, _, b)| v > *b) {
-            best = Some((vs, m, v));
+        let current = !m.is_deprecated();
+        if range.satisfies(&v)
+            && best
+                .as_ref()
+                .is_none_or(|(_, _, c, b)| (current, &v) > (*c, b))
+        {
+            best = Some((vs, m, current, v));
         }
     }
-    best.map(|(v, m, _)| (v, m)).ok_or_else(no_version)
+    best.map(|(v, m, _, _)| (v, m)).ok_or_else(no_version)
 }
 
 pub fn satisfies(version: &str, spec: &str) -> bool {
@@ -190,12 +292,48 @@ mod tests {
         assert_eq!(pick(&p, "p", "latest").unwrap().0, "1.2.0");
         assert_eq!(pick(&p, "p", "1.0.0").unwrap().0, "1.0.0");
         assert_eq!(pick(&p, "p", "^1").unwrap().0, "1.2.0");
-        assert_eq!(pick(&p, "p", ">=1").unwrap().0, "2.0.0");
+        assert_eq!(pick(&p, "p", ">=2").unwrap().0, "2.0.0");
         assert!(matches!(pick(&p, "p", "^3"), Err(Error::NoVersion { .. })));
         assert!(matches!(
             pick(&p, "p", "not a range"),
             Err(Error::NoVersion { .. })
         ));
+    }
+
+    #[test]
+    fn a_range_prefers_latest_then_anything_not_deprecated() {
+        let p = packument(&["1.0.0", "1.1.0", "1.2.0"], "1.1.0");
+        assert_eq!(
+            pick(&p, "p", "^1").unwrap().0,
+            "1.1.0",
+            "a release withdrawn by moving `latest` back stays withdrawn"
+        );
+        let doc = r#"{"dist-tags": {"latest": "2.0.0"}, "versions": {
+            "1.0.0": {"dist": {"tarball": "u"}},
+            "1.1.0": {"deprecated": "broken", "dist": {"tarball": "u"}},
+            "2.0.0": {"deprecated": "broken", "dist": {"tarball": "u"}}}}"#;
+        let p = parse("p", doc.as_bytes()).unwrap();
+        assert_eq!(pick(&p, "p", "^1").unwrap().0, "1.0.0");
+        assert_eq!(pick(&p, "p", "*").unwrap().0, "1.0.0");
+        assert_eq!(pick(&p, "p", "latest").unwrap().0, "2.0.0");
+        assert_eq!(
+            pick(&p, "p", "2").unwrap().0,
+            "2.0.0",
+            "nothing else matches"
+        );
+    }
+
+    #[test]
+    fn only_a_name_that_stays_in_node_modules_is_safe() {
+        for good in ["chalk", "@scope/name", "Upper_case-1.2", "_private"] {
+            assert!(safe_name(good), "{good}");
+        }
+        for bad in [
+            "", ".", "..", ".bin", "../x", "@s/../x", "a/b", "@s", "@/x", "@s/", "@s/n/m", "a\\b",
+            "c:x",
+        ] {
+            assert!(!safe_name(bad), "{bad}");
+        }
     }
 
     #[test]

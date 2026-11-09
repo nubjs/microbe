@@ -17,6 +17,8 @@ struct Pkg {
     /// Mirror `optional` into `dependencies` too, as `npm publish` does on the registry.
     mirror_optional: bool,
     bin: Option<&'static str>,
+    /// A `bin` value in the packument with no file behind it in the tarball.
+    raw_bin: Option<&'static str>,
     os: &'static [&'static str],
     install_script: bool,
 }
@@ -29,6 +31,7 @@ const fn pkg(name: &'static str, version: &'static str) -> Pkg {
         optional: &[],
         mirror_optional: false,
         bin: None,
+        raw_bin: None,
         os: &[],
         install_script: false,
     }
@@ -67,7 +70,7 @@ impl FakeRegistry {
                 "os": p.os, "hasInstallScript": p.install_script,
                 "dist": { "tarball": tarball_url, "integrity": integrity },
             });
-            if let Some(b) = p.bin {
+            if let Some(b) = p.bin.or(p.raw_bin) {
                 manifest["bin"] = serde_json::json!(b);
             }
             let entry = packuments.entry(p.name).or_insert((Vec::new(), p.version));
@@ -350,6 +353,177 @@ fn reinstall_at_another_version_replaces_the_directory() {
     );
     let third = m.install("tool@2", dir.path()).unwrap();
     assert_eq!(third.packages, 0, "a satisfied request fetches nothing");
+    let tagged = m.install("tool@latest", dir.path()).unwrap();
+    assert_eq!(
+        tagged.packages, 0,
+        "a tag is compared by the version it names"
+    );
+}
+
+#[test]
+fn a_present_package_costs_no_request_and_keeps_its_bins() {
+    let reg = FakeRegistry::publish(&[Pkg {
+        bin: Some("cli.js"),
+        ..pkg("tool", "1.0.0")
+    }]);
+    let dir = tempdir();
+    microbe(&reg).install("tool@^1", dir.path()).unwrap();
+    reg.requests.lock().unwrap().clear();
+    let again = microbe(&reg).install("tool@^1", dir.path()).unwrap();
+    assert!(reg.requests.lock().unwrap().is_empty());
+    assert_eq!(again.roots[0].version, "1.0.0");
+    assert!(again.bins.contains_key("tool"));
+}
+
+#[test]
+fn each_install_reads_the_registry_afresh() {
+    let reg = FakeRegistry::publish(&[pkg("tool", "1.0.0")]);
+    let m = microbe(&reg);
+    let first = m.install("tool", tempdir().path()).unwrap();
+    assert_eq!(first.roots[0].version, "1.0.0");
+    let newer = FakeRegistry::publish(&[pkg("tool", "1.0.0"), pkg("tool", "1.1.0")]);
+    *reg.urls.lock().unwrap() = newer.urls.lock().unwrap().clone();
+    let second = m.install("tool", tempdir().path()).unwrap();
+    assert_eq!(second.roots[0].version, "1.1.0");
+}
+
+#[test]
+fn an_install_that_failed_is_finished_by_the_next_one() {
+    let publish = || {
+        FakeRegistry::publish(&[
+            Pkg {
+                deps: &[("mid", "1.0.0")],
+                ..pkg("root", "1.0.0")
+            },
+            Pkg {
+                deps: &[("leaf", "1.0.0")],
+                ..pkg("mid", "1.0.0")
+            },
+            pkg("leaf", "1.0.0"),
+        ])
+    };
+    let broken = publish();
+    broken.corrupt_tarball("leaf", "1.0.0");
+    let dir = tempdir();
+    microbe(&broken).install("root", dir.path()).unwrap_err();
+    let good = publish();
+    microbe(&good).install("root", dir.path()).unwrap();
+    assert!(node_modules(&dir).join("leaf/index.js").is_file());
+    let settled = microbe(&good).install("root", dir.path()).unwrap();
+    assert_eq!(settled.packages, 0, "a finished install is trusted again");
+}
+
+#[test]
+fn replacing_a_package_keeps_the_nested_dependency_it_still_needs() {
+    // `b@2` nests under `a` because `b@1` holds the flat slot. Replacing `a` deletes
+    // everything under it, so the nested copy must not count as already installed.
+    let reg = FakeRegistry::publish(&[
+        pkg("b", "1.0.0"),
+        pkg("b", "2.0.0"),
+        Pkg {
+            deps: &[("b", "^2")],
+            ..pkg("a", "1.0.0")
+        },
+        Pkg {
+            deps: &[("b", "^2")],
+            ..pkg("a", "1.1.0")
+        },
+    ]);
+    let dir = tempdir();
+    let m = microbe(&reg);
+    m.install_all([("b", "1.0.0"), ("a", "1.0.0")], dir.path())
+        .unwrap();
+    let nested = node_modules(&dir).join("a/node_modules/b");
+    assert_eq!(installed_version(&nested), "2.0.0");
+    m.install("a@1.1.0", dir.path()).unwrap();
+    assert_eq!(installed_version(&nested), "2.0.0");
+}
+
+#[test]
+fn a_directory_with_an_unreadable_manifest_is_replaced() {
+    let reg = FakeRegistry::publish(&[pkg("tool", "1.0.0")]);
+    let dir = tempdir();
+    let broken = dir.path().join("node_modules/tool");
+    std::fs::create_dir_all(&broken).unwrap();
+    std::fs::write(broken.join("package.json"), "{ truncated").unwrap();
+    let done = microbe(&reg).install("tool", dir.path()).unwrap();
+    assert_eq!(done.packages, 1);
+    assert!(broken.join("index.js").is_file());
+}
+
+#[test]
+fn an_npm_alias_installs_the_real_package_under_the_alias() {
+    let reg = FakeRegistry::publish(&[
+        Pkg {
+            deps: &[("renamed", "npm:@scope/real@^1")],
+            ..pkg("root", "1.0.0")
+        },
+        pkg("@scope/real", "1.2.0"),
+        pkg("renamed", "9.9.9"),
+    ]);
+    let dir = tempdir();
+    let m = microbe(&reg);
+    assert_eq!(m.install("root", dir.path()).unwrap().packages, 2);
+    let renamed = node_modules(&dir).join("renamed");
+    assert_eq!(installed_version(&renamed), "1.2.0");
+    let aliased = m.install("renamed@npm:@scope/real@^1", dir.path()).unwrap();
+    assert_eq!(
+        aliased.packages, 0,
+        "the alias is satisfied by its real package"
+    );
+    assert_eq!(aliased.roots[0].name, "renamed");
+    m.install("renamed@9", dir.path()).unwrap();
+    assert_eq!(
+        installed_version(&renamed),
+        "9.9.9",
+        "the real package does not satisfy a request for the name it shadows"
+    );
+}
+
+#[test]
+fn a_dependency_name_that_leaves_node_modules_is_refused() {
+    let reg = FakeRegistry::publish(&[
+        Pkg {
+            deps: &[("../victim", "1.0.0")],
+            ..pkg("root", "1.0.0")
+        },
+        pkg("../victim", "1.0.0"),
+    ]);
+    let dir = tempdir();
+    let victim = dir.path().join("victim");
+    std::fs::create_dir_all(dir.path().join("node_modules")).unwrap();
+    std::fs::create_dir_all(&victim).unwrap();
+    std::fs::write(victim.join("keep"), "x").unwrap();
+    let err = microbe(&reg).install("root", dir.path()).unwrap_err();
+    assert!(matches!(err, Error::UnsafePath(_)), "{err}");
+    assert!(victim.join("keep").is_file());
+}
+
+#[test]
+fn a_bin_path_outside_its_package_is_neither_linked_nor_made_executable() {
+    let reg = FakeRegistry::publish(&[Pkg {
+        raw_bin: Some("../victim.sh"),
+        ..pkg("evil", "1.0.0")
+    }]);
+    let dir = tempdir();
+    let nm = dir.path().join("node_modules");
+    std::fs::create_dir_all(&nm).unwrap();
+    std::fs::write(nm.join("victim.sh"), "x").unwrap();
+    let done = microbe(&reg).install("evil", dir.path()).unwrap();
+    assert!(done.bins.is_empty(), "{:?}", done.bins);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(nm.join("victim.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o111,
+            0,
+            "a file outside the package was made executable"
+        );
+    }
 }
 
 #[test]
