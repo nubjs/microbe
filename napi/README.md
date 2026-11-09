@@ -41,11 +41,11 @@ done.packages;               // tarballs extracted by this call; a package alrea
 done.skippedInstallScripts;  // "name@version" of every package whose install script was not run
 ```
 
-A failure rejects, or throws from `installSync`, with the crate's error message: no version matches the range, an integrity mismatch, an HTTP status after retries, an `.npmrc` key that cannot be used as written. A second install into the same directory fetches only what is missing or at the wrong version.
+A failure rejects, or throws from `installSync`, with the crate's error message: no version matches the range, an integrity mismatch, an HTTP status after retries, an `.npmrc` key that cannot be used as written. A second install into the same directory fetches only what is missing or at the wrong version. Two installs must not run in one directory at the same time.
 
 ## Everything is explicit
 
-Nothing is read from environment variables and no file is discovered by walking the filesystem. An `.npmrc` is applied only from the path given, and a `${VAR}` in it is an error rather than a token sent as written. Credentials are keyed by URL prefix as npm keys them, and the longest matching prefix wins.
+Nothing is read from environment variables and no file is discovered by walking the filesystem. An `.npmrc` is applied only from the path given, and a `${VAR}` in it is an error rather than a token sent as written. The `registry` option beats a `registry` key in an `.npmrc`. Credentials are keyed by URL prefix as npm keys them, and the longest matching prefix wins.
 
 ## Network
 

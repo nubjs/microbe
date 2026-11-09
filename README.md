@@ -7,7 +7,7 @@ use microbe::Microbe;
 use std::path::Path;
 
 let done = Microbe::new()?.install("esbuild@^0.25", Path::new("/tmp/tools"))?;
-let esbuild = &done.bins["esbuild"]; // /tmp/tools/node_modules/.bin/esbuild -> esbuild/bin/esbuild
+let esbuild = &done.bins["esbuild"]; // /tmp/tools/node_modules/esbuild/bin/esbuild
 ```
 
 ```sh
@@ -23,7 +23,7 @@ cargo install microbe             # the `microbe` binary
 npm install @nubjs/microbe        # the Node-API addon; the platform build is an optional dependency
 ```
 
-On Linux the library and the binary carry no TLS by default and reach the registry through `node`, `curl`, `wget` or `python3` from the host. A build with `--features tls` carries rustls instead, for about 1.1 MB. The addon always carries TLS. See [How it reaches the network](#how-it-reaches-the-network).
+The crate needs Rust 1.88 or later. On Linux the library and the binary carry no TLS by default and reach the registry through `node`, `curl`, `wget` or `python3` from the host. A build with `--features tls` carries rustls instead, for about 1.1 MB. The addon always carries TLS. See [How it reaches the network](#how-it-reaches-the-network).
 
 ## Who it is for
 
@@ -46,7 +46,7 @@ let m = Microbe::new()?                                    // in-binary TLS, or 
     .npmrc_contents("registry=https://r.example.com\n")?   // or from contents the embedder already holds
     .concurrency(8);                                       // parallel fetches; default 16
 
-// One package by spec: `name`, `name@tag`, `name@1.2.3`, `name@^1`, `@scope/name@^1`.
+// One package by spec: `name`, `name@tag`, `name@1.2.3`, `name@^1`, `@scope/name@^1`, `alias@npm:name@^1`.
 let one = m.install("eslint@^9", dir)?;
 // A dependency map, the shape of package.json#/dependencies. Duplicate names take the first range.
 let many = m.install_all([("eslint", "^9"), ("prettier", "3")], dir)?;
@@ -84,7 +84,7 @@ match Microbe::new()?.install("eslint@^9", dir) {
     Err(Error::Status { url, status }) => {}        // a non-2xx answer, after retries for 429 and 5xx
     Err(Error::NoVersion { name, spec }) => {}      // no published version satisfies the range or tag
     Err(Error::Integrity { name, version }) => {}   // the tarball does not match dist.integrity / dist.shasum
-    Err(Error::UnsafePath(entry)) => {}             // a tarball entry would escape its package directory
+    Err(Error::UnsafePath(path)) => {}              // a tarball entry or a dependency name would land outside node_modules
     Err(Error::Registry { name, detail }) => {}     // the packument could not be parsed
     Err(Error::Npmrc(detail)) => {}                 // a consumed .npmrc key cannot be used as written, such as `${VAR}`
     Err(Error::Io(e)) => {}                         // a filesystem operation failed
@@ -105,6 +105,7 @@ usage: microbe install <name[@spec]>... --dir <path> [options]
 options: --registry <url>   registry for unscoped packages; default https://registry.npmjs.org
          --npmrc <file>     apply this .npmrc; nothing is discovered
          --json             print the installation as JSON
+         --help, --version
 ```
 
 The `install` verb takes one or more specs. The `install-manifest` verb takes the `dependencies` map of a JSON file, or of stdin for `-`; a whole `package.json` is valid input, and every other key in it is ignored. Both install into `<dir>/node_modules`, and both print one line per requested package, the count of tarballs extracted, and every bin linked:
@@ -135,7 +136,7 @@ With `--json` the same installation is printed as one object, the serialized `In
 | --- | --- |
 | 0 | Installed. |
 | 1 | The install failed; stderr carries `microbe: <error>`. |
-| 2 | Usage error, before any network: no verb, no `--dir`, no spec, a wrong positional count, or a flag the binary does not have. |
+| 2 | Usage error, before any network: no verb, no `--dir`, no spec, a wrong positional count, a flag missing its value, or a flag the binary does not have. |
 
 ## Node API
 
@@ -162,7 +163,7 @@ done.skippedInstallScripts;  // "name@version" of every package whose install sc
 
 ## Everything is explicit
 
-Microbe is an embedder-facing tool, not a human CLI, so it never guesses. The target directory is always given. Nothing is read from environment variables. No configuration file is discovered by walking up the filesystem: a registry is passed as a URL, and an `.npmrc` is passed as an explicit path. What the embedder does not pass, Microbe does not know about. The one thing detected at run time is which HTTPS client the host has, and an embedder that supplies a `Transport` opts out of that too.
+Microbe is an embedder-facing tool, not a human CLI, so it never guesses. The target directory is always given. Nothing is read from environment variables. No configuration file is discovered by walking up the filesystem: a registry is passed as a URL, and an `.npmrc` is passed as an explicit path. What the embedder does not pass, Microbe does not know about. The one thing detected at run time is which HTTPS client the host has, and an embedder that supplies a `Transport` opts out of that too. Those clients honor the standard proxy variables such as `HTTPS_PROXY`.
 
 ## Registry and credentials
 
@@ -190,30 +191,33 @@ The in-binary client is used on macOS and Windows, and on Linux when built with 
 
 **The default Linux build requires one of those four programs on `PATH`, or a `Transport` supplied by the embedder.** A survey of 16 popular container base images found `curl` on 4 of them, and 8 carried neither `curl` nor `wget`; every Node image carries Node. The Debian and Ubuntu slim images carry none of the four and no CA bundle either, so on those the answer is `--features tls` or an embedder-supplied `Transport`.
 
-Every request is bounded by a 300 second timeout, npm's default, and a transport failure or a 429 or 5xx response is retried twice. Every host client is told to refuse a redirect off HTTPS: a tarball is protected by its integrity hash, but a packument is not.
+Every request is bounded by a 300 second timeout, npm's default, and a transport failure or a 429 or 5xx response is retried twice. Every transport refuses a redirect from HTTPS to HTTP: a tarball is protected by its integrity hash, but a packument is not.
+
+A credential reaches `curl` and `python3` on stdin, never on a command line, where any other process could read it. The `wget` client can only take one on its command line, so it refuses a request that carries one.
 
 ## What it implements
 
 Packages land flat under `<dir>/node_modules`, placed the way Node's resolver expects, and the same request always produces the same tree.
 
-- **Resolution** is first-wins over `dependencies` plus platform-matching `optionalDependencies`, one abbreviated packument fetch per package name. A name listed under `optionalDependencies` is optional even when it also appears under `dependencies`, because `npm publish` mirrors it there.
+- **Resolution** is first-wins over `dependencies` plus platform-matching `optionalDependencies`, one abbreviated packument fetch per package name. A range picks a version the way npm does: the `latest` tag when the range admits it and it is not deprecated, otherwise the highest match that is not deprecated. An `npm:real@range` alias installs the real package under the alias. Git, URL and file specs are not supported: a required dependency that uses one fails with `Error::NoVersion`. A name listed under `optionalDependencies` is optional even when it also appears under `dependencies`, because `npm publish` mirrors it there.
 - **Placement** is flat; a version conflict nests the loser under its dependent, which is what Node's resolver walks up to find.
 - **Optionality covers the whole branch.** When anything an optional dependency itself requires cannot be resolved or fails its integrity check, that optional dependency is dropped along with every package only it needed, and the install succeeds. A required path reaching the same package fails the install.
 - **Bundled dependencies** ship inside their parent's tarball and are never fetched.
 - **Integrity** is checked against `dist.integrity`, falling back to the pre-SRI `dist.shasum`. A tarball entry whose path would escape its package directory is refused.
-- **Bins** of every requested package are linked under `node_modules/.bin`: a relative symlink on Unix, a `.cmd` shim that runs the script with `node` on Windows. A requested package wins a name clash with a dependency.
+- **Bins** of every requested package are linked under `node_modules/.bin`: a relative symlink on Unix, a `.cmd` shim that runs the script with `node` on Windows. A requested package wins a name clash with a dependency. A bin path outside its package is ignored.
+- **Existing packages** at a satisfying version are left alone and cost no request; only a bare name or a dist-tag asks the registry what it points at. An install that fails or is killed leaves a marker in `node_modules`, and the next install replaces everything it needs. Two installs must not run in one directory at the same time.
 - **Peer dependencies** are ignored.
 - **Install scripts** are not run. Packages that declare one are named in `Installation::skipped_install_scripts` so the caller can decide what that means; for a prebuilt-binary package like esbuild or biome the postinstall is a no-op, because the platform package carrying the binary is an optional dependency that Microbe already installed.
 
 ## Size
 
-Stripped, `opt-level = "z"` with fat LTO, measured by CI on 2026-09-22 with the stable toolchain:
+Stripped, `opt-level = "z"` with fat LTO, measured by CI on 2026-11-09 with the stable toolchain:
 
 | Target | default build | TLS in it |
 | --- | --- | --- |
-| aarch64-apple-darwin | 853 KB | Security.framework, always |
-| x86_64-pc-windows-msvc | 800 KB | SChannel, always |
-| x86_64-unknown-linux-gnu | 702 KB | none; `--features tls` adds rustls for about 1.1 MB |
+| aarch64-apple-darwin | 886 KB | Security.framework, always |
+| x86_64-pc-windows-msvc | 820 KB | SChannel, always |
+| x86_64-unknown-linux-gnu | 733 KB | none; `--features tls` adds rustls for about 1.1 MB |
 
 The budget is decided by TLS and nothing else. The resolve, verify and extract core is about 60 KB of code. On macOS and Windows the operating system's TLS is reachable through Rust bindings for about 300 KB, with no C compiled and no process spawned, so it is always in. On Linux there is no system TLS to bind to, a rustls stack costs about 1.1 MB, and so the Linux build links none by default and borrows an HTTPS client the host already has. The CI size job fails if any default build reaches 1 MB.
 

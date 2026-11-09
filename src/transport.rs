@@ -16,17 +16,20 @@
 //!    Python with its ssl module and a CA bundle. Not tried on macOS, where a missing
 //!    `python3` is a stub that opens a dialog offering to install the developer tools.
 //!
-//! The host clients are told to refuse a redirect off HTTPS: a tarball is protected by its
+//! Every transport refuses a redirect from HTTPS to HTTP: a tarball is protected by its
 //! integrity hash, but a packument is not, so a downgrade could substitute a tarball and its
-//! hash together. An embedder with its own HTTP client skips all of this by implementing
-//! [`Transport`]. Every transport here is safe to call from many threads at once; the
-//! installer does. Every request is bounded by [`TIMEOUT`], npm's default fetch timeout;
-//! the installer retries a transport failure or a 5xx twice before giving up.
+//! hash together. A plain `http://` registry named by the caller is used as named. A
+//! credential is never put on a host client's command line, where any other process can read
+//! it, and wget has no other way to take one, so wget refuses a request that carries one.
+//! An embedder with its own HTTP client skips all of this by implementing [`Transport`].
+//! Every transport here is safe to call from many threads at once; the installer does.
+//! Every request is bounded by [`TIMEOUT`], npm's default fetch timeout; the installer
+//! retries a transport failure or a 5xx twice before giving up.
 
 use crate::error::Error;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -34,6 +37,8 @@ use std::sync::{Arc, Mutex};
 /// A request never outlives this, so a stalled connection cannot hang an install.
 pub const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// How the installer reaches the network, for an embedder that brings its own HTTP client
+/// or a test that brings none. It is called from many threads at once.
 pub trait Transport: Send + Sync {
     /// Fetch `url` sending `headers` (always an `accept`, sometimes an `authorization`).
     /// A non-2xx status is an error.
@@ -65,14 +70,30 @@ fn detect_host() -> Result<Box<dyn Transport>, Error> {
     Err(Error::NoTransport(vec!["node", "curl", "wget", "python3"]))
 }
 
+/// `--help`, because busybox wget has no `--version`.
 fn available(program: &str) -> bool {
     Command::new(program)
-        .arg("--version")
+        .arg("--help")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|s| s.success())
+}
+
+/// Run a host client with `input` on its stdin, the one place a credential is safe to pass.
+fn run_with_input(mut command: Command, program: &str, input: &str) -> Result<Output, Error> {
+    let failed = |e: std::io::Error| Error::Transport(format!("{program}: {e}"));
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(failed)?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(input.as_bytes()).map_err(failed)?;
+    }
+    child.wait_with_output().map_err(failed)
 }
 
 fn check_status(url: &str, status: u16) -> Result<(), Error> {
@@ -103,8 +124,10 @@ rl.on('line', async (line) => {
   let status = 0, body = Buffer.alloc(0);
   try {
     const r = await fetch(url, { headers: Object.fromEntries(JSON.parse(headers)), signal: AbortSignal.timeout(TIMEOUT_MS) });
-    status = r.status; body = Buffer.from(await r.arrayBuffer());
-  } catch (e) {}
+    if (url.startsWith('https:') && !r.url.startsWith('https:')) throw new Error('redirected off https to ' + r.url);
+    const bytes = Buffer.from(await r.arrayBuffer());
+    status = r.status; body = bytes;
+  } catch (e) { status = 0; body = Buffer.from(String(e.cause?.code || e.cause?.message || e.message)); }
   process.stdout.write(Buffer.concat([Buffer.from(id + ' ' + status + ' ' + body.length + '\n'), body]));
 });
 rl.on('close', () => process.exit(0));
@@ -128,6 +151,9 @@ impl NodeFetch {
     fn spawn() -> Option<Self> {
         let mut child = Command::new("node")
             .args(["-e", NODE_SCRIPT])
+            // The other host clients read the proxy variables themselves; Node's fetch does
+            // only when told to. Older Nodes ignore this.
+            .env("NODE_USE_ENV_PROXY", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -206,7 +232,8 @@ impl Transport for NodeFetch {
             .recv()
             .map_err(|_| Error::Transport("node transport exited".into()))??;
         if status == 0 {
-            return Err(Error::Transport(format!("node: fetch failed for {url}")));
+            let cause = String::from_utf8_lossy(&body);
+            return Err(Error::Transport(format!("node: {cause} for {url}")));
         }
         check_status(url, status)?;
         Ok(body)
@@ -229,33 +256,51 @@ impl Drop for NodeFetch {
 struct Curl;
 
 /// `-w` appends the status after the body, split back off in `get`; `--proto` and
-/// `--proto-redir` pin both the request and any redirect to HTTPS.
-fn curl_args(url: &str, headers: &[(&str, &str)]) -> Vec<String> {
-    let mut args: Vec<String> = [
+/// `--proto-redir` pin an HTTPS request and any redirect to HTTPS; `-K -` reads the headers
+/// from stdin.
+fn curl_args(url: &str) -> Vec<String> {
+    let scheme = if url.starts_with("https:") {
+        "=https"
+    } else {
+        "=http,https"
+    };
+    [
         "-fsSL",
         "--compressed",
         "--max-time",
         TIMEOUT_SECS,
         "--proto",
-        "=https",
+        scheme,
         "--proto-redir",
-        "=https",
+        scheme,
         "-w",
         "\n%{http_code}",
+        "-K",
+        "-",
+        url,
     ]
     .into_iter()
     .map(String::from)
-    .collect();
-    for (k, v) in headers {
-        args.push("-H".into());
-        args.push(format!("{k}: {v}"));
-    }
-    args.push(url.into());
-    args
+    .collect()
 }
 
+/// The headers as a curl config file.
+fn curl_config(headers: &[(&str, &str)]) -> String {
+    headers
+        .iter()
+        .map(|(k, v)| {
+            let line = format!("{k}: {v}")
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"");
+            format!("header = \"{line}\"\n")
+        })
+        .collect()
+}
+
+/// `-S` prints the responses to stderr; both GNU wget and busybox have it, and neither has a
+/// flag that pins a redirect to HTTPS.
 fn wget_args(url: &str, headers: &[(&str, &str)]) -> Vec<String> {
-    let mut args: Vec<String> = ["-q", "--https-only", "-O", "-", "--timeout", TIMEOUT_SECS]
+    let mut args: Vec<String> = ["-qS", "-O", "-", "-T", TIMEOUT_SECS]
         .into_iter()
         .map(String::from)
         .collect();
@@ -266,13 +311,31 @@ fn wget_args(url: &str, headers: &[(&str, &str)]) -> Vec<String> {
     args
 }
 
+/// The final status in `-S` output, if a response came back. A `Location` from HTTPS to HTTP
+/// is refused here.
+fn wget_status(url: &str, log: &str) -> Result<Option<u16>, Error> {
+    let mut status = None;
+    for line in log.lines().map(str::trim) {
+        if let Some(rest) = line.strip_prefix("HTTP/") {
+            status = rest.split_whitespace().nth(1).and_then(|s| s.parse().ok());
+        } else if let Some((key, value)) = line.split_once(':')
+            && key.eq_ignore_ascii_case("location")
+            && url.starts_with("https:")
+            && value.trim().to_ascii_lowercase().starts_with("http:")
+        {
+            return Err(Error::Transport(format!(
+                "wget: redirected off https for {url}"
+            )));
+        }
+    }
+    Ok(status)
+}
+
 impl Transport for Curl {
     fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<Vec<u8>, Error> {
-        let out = Command::new("curl")
-            .args(curl_args(url, headers))
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|e| Error::Transport(format!("curl: {e}")))?;
+        let mut command = Command::new("curl");
+        command.args(curl_args(url));
+        let out = run_with_input(command, "curl", &curl_config(headers))?;
         let body = out.stdout;
         let cut = body.iter().rposition(|&b| b == b'\n').unwrap_or(body.len());
         let status: u16 = std::str::from_utf8(&body[cut..])
@@ -281,8 +344,9 @@ impl Transport for Curl {
             .unwrap_or(0);
         if !out.status.success() && status == 0 {
             return Err(Error::Transport(format!(
-                "curl exited {} for {url}",
-                out.status
+                "curl exited {} for {url}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
             )));
         }
         check_status(url, status)?;
@@ -294,15 +358,30 @@ struct Wget;
 
 impl Transport for Wget {
     fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<Vec<u8>, Error> {
+        if headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+        {
+            return Err(Error::Transport(
+                "wget can only take a credential on its command line, where other processes \
+                 can read it; install curl or build with `--features tls`"
+                    .into(),
+            ));
+        }
         let out = Command::new("wget")
             .args(wget_args(url, headers))
             .stdin(Stdio::null())
             .output()
             .map_err(|e| Error::Transport(format!("wget: {e}")))?;
+        let log = String::from_utf8_lossy(&out.stderr);
+        if let Some(status) = wget_status(url, &log)? {
+            check_status(url, status)?;
+        }
         if !out.status.success() {
             return Err(Error::Transport(format!(
-                "wget exited {} for {url}",
-                out.status
+                "wget exited {} for {url}: {}",
+                out.status,
+                log.trim()
             )));
         }
         Ok(out.stdout)
@@ -313,18 +392,22 @@ impl Transport for Wget {
 // In-binary TLS (opt-in). ureq's Agent pools connections and is safe to share across threads.
 
 /// One `python3` process per request, using the standard library's `urllib` and `ssl`.
-/// The body goes to stdout; an HTTP error puts its status on stderr and exits 3; a redirect
-/// off HTTPS is refused.
+/// The headers arrive on stdin. The body goes to stdout; an HTTP error puts its status on
+/// stderr and exits 3; a redirect off HTTPS is refused, and urllib would otherwise forward
+/// the credential to whatever host a redirect names.
 struct Python;
 
 const PYTHON_SCRIPT: &str = r#"
-import sys, json, urllib.request, urllib.error
-url, headers, timeout = sys.argv[1], dict(json.loads(sys.argv[2])), int(sys.argv[3])
+import sys, json, urllib.request, urllib.error, urllib.parse
+url, timeout, headers = sys.argv[1], int(sys.argv[2]), dict(json.load(sys.stdin))
 class HttpsOnly(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if not newurl.startswith("https://"):
+        if req.full_url.startswith("https://") and not newurl.startswith("https://"):
             raise urllib.error.HTTPError(newurl, code, "redirect off https refused", headers, fp)
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new and urllib.parse.urlsplit(newurl).netloc != urllib.parse.urlsplit(req.full_url).netloc:
+            new.remove_header("Authorization")
+        return new
 opener = urllib.request.build_opener(HttpsOnly())
 try:
     with opener.open(urllib.request.Request(url, headers=headers), timeout=timeout) as r:
@@ -338,11 +421,9 @@ impl Transport for Python {
     fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<Vec<u8>, Error> {
         let headers = serde_json::to_string(headers)
             .map_err(|e| Error::Transport(format!("python3: {e}")))?;
-        let out = Command::new("python3")
-            .args(["-c", PYTHON_SCRIPT, url, &headers, TIMEOUT_SECS])
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|e| Error::Transport(format!("python3: {e}")))?;
+        let mut command = Command::new("python3");
+        command.args(["-c", PYTHON_SCRIPT, url, TIMEOUT_SECS]);
+        let out = run_with_input(command, "python3", &headers)?;
         if out.status.success() {
             return Ok(out.stdout);
         }
@@ -394,7 +475,12 @@ mod builtin {
 
     impl Transport for Builtin {
         fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<Vec<u8>, Error> {
-            let mut req = self.0.get(url);
+            let mut req = self
+                .0
+                .get(url)
+                .config()
+                .https_only(url.starts_with("https:"))
+                .build();
             for (k, v) in headers {
                 req = req.header(*k, *v);
             }
@@ -415,17 +501,70 @@ mod tests {
 
     #[test]
     fn host_clients_refuse_to_leave_https() {
-        let curl = curl_args("https://r/x", &[("accept", "*/*")]);
-        let proto = curl.iter().position(|a| a == "--proto").unwrap();
-        let redir = curl.iter().position(|a| a == "--proto-redir").unwrap();
-        assert_eq!(
-            (&curl[proto + 1], &curl[redir + 1]),
-            (&"=https".into(), &"=https".into())
-        );
-        assert!(
-            wget_args("https://r/x", &[("accept", "*/*")]).contains(&"--https-only".to_string())
-        );
+        let flag = |url: &str, name: &str| {
+            let args = curl_args(url);
+            let at = args.iter().position(|a| a == name).unwrap();
+            args[at + 1].clone()
+        };
+        assert_eq!(flag("https://r/x", "--proto"), "=https");
+        assert_eq!(flag("https://r/x", "--proto-redir"), "=https");
+        assert_eq!(flag("http://localhost:4873/x", "--proto"), "=http,https");
+        assert!(NODE_SCRIPT.contains("redirected off https"));
         assert!(PYTHON_SCRIPT.contains("redirect off https refused"));
+        let refused = "  HTTP/1.1 302 Found\n  location: HTTP://evil/x\n  HTTP/1.1 200 OK\n";
+        assert!(wget_status("https://r/x", refused).is_err());
+        assert_eq!(wget_status("http://r/x", refused).unwrap(), Some(200));
+    }
+
+    #[test]
+    fn wget_reports_the_final_status_and_refuses_a_credential() {
+        let log = "  HTTP/1.1 301 Moved\n  Location: https://r/y\n  HTTP/1.1 404 Not Found\n";
+        assert_eq!(wget_status("https://r/x", log).unwrap(), Some(404));
+        assert_eq!(wget_status("https://r/x", "no response").unwrap(), None);
+        let err = Wget
+            .get("https://r/x", &[("authorization", "Bearer secret")])
+            .unwrap_err();
+        assert!(!err.to_string().contains("secret"), "{err}");
+    }
+
+    /// A local HTTP server that answers with the request headers it received.
+    fn header_echo_server() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut body = String::new();
+                for line in BufReader::new(&stream).lines().map_while(Result::ok) {
+                    if line.is_empty() {
+                        break;
+                    }
+                    body.push_str(&line.to_ascii_lowercase());
+                    body.push('\n');
+                }
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn curl_and_python_deliver_a_credential_passed_on_stdin() {
+        let port = header_echo_server();
+        let url = format!("http://127.0.0.1:{port}/x");
+        let headers = [("authorization", r#"Bearer a"b\c"#)];
+        let want = r#"authorization: bearer a"b\c"#;
+        if available("curl") {
+            let body = Curl.get(&url, &headers).unwrap();
+            assert!(String::from_utf8_lossy(&body).contains(want));
+        }
+        if !cfg!(target_os = "macos") && available("python3") {
+            let body = Python.get(&url, &headers).unwrap();
+            assert!(String::from_utf8_lossy(&body).contains(want));
+        }
     }
 
     #[test]

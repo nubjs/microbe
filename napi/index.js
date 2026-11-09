@@ -3,6 +3,10 @@
 "use strict";
 
 function musl() {
+  // A file read first: building Node's report can take seconds where interfaces are many.
+  try {
+    return require("node:fs").readFileSync("/usr/bin/ldd", "utf8").includes("musl");
+  } catch {}
   // Node's own report carries glibcVersionRuntime on glibc and not on musl; no subprocess.
   try {
     const header = process.report?.getReport?.()?.header;

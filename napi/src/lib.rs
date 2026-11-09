@@ -53,9 +53,9 @@ fn pairs(deps: Deps) -> Vec<(String, String)> {
     match deps {
         Either::A(specs) => specs
             .into_iter()
-            .map(|s| match s.rfind('@') {
-                Some(i) if i > 0 => (s[..i].to_string(), s[i + 1..].to_string()),
-                _ => (s, String::new()),
+            .map(|s| {
+                let (name, range) = microbe::split_spec(&s);
+                (name.to_string(), range.to_string())
             })
             .collect(),
         Either::B(map) => map.into_iter().collect::<BTreeMap<_, _>>().into_iter().collect(),
@@ -68,14 +68,15 @@ fn js(e: microbe::Error) -> Error {
 
 fn run(deps: &[(String, String)], dir: &str, opts: &Options) -> Result<Installation> {
     let mut m = microbe::Microbe::new().map_err(js)?;
-    if let Some(r) = &opts.registry {
-        m = m.registry(r);
-    }
     if let Some(p) = &opts.npmrc {
         m = m.npmrc(Path::new(p)).map_err(js)?;
     }
     if let Some(c) = &opts.npmrc_contents {
         m = m.npmrc_contents(c).map_err(js)?;
+    }
+    // After the files, so that a value passed directly wins, as `--registry` does.
+    if let Some(r) = &opts.registry {
+        m = m.registry(r);
     }
     if let Some(n) = opts.concurrency {
         m = m.concurrency(n as usize);

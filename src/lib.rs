@@ -24,7 +24,10 @@
 //! [`Installation::skipped_install_scripts`]), honour `peerDependencies`, write a lockfile,
 //! keep a cache or store, or reconcile with an existing `node_modules` beyond replacing a
 //! package it is about to install at another version. Those are the parts of a
-//! package manager that take up the space.
+//! package manager that take up the space. A package already on disk at a satisfying
+//! version is left alone and costs no request; an install that did not finish leaves a
+//! marker that makes the next one replace everything it needs. Two installs must not run
+//! in one directory at the same time.
 
 mod error;
 mod extract;
@@ -43,12 +46,18 @@ pub use transport::{TIMEOUT, Transport};
 
 use registry::{Manifest, Packument};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// The registry used until [`Microbe::registry`] or an `.npmrc` names another.
 pub const DEFAULT_REGISTRY: &str = "https://registry.npmjs.org";
-const ABBREVIATED: &str = "application/vnd.npm.install-v1+json";
+/// npm's own value: the abbreviated document, or the full one from a registry without it.
+const ABBREVIATED: &str =
+    "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*";
+/// Written to `node_modules` before anything on disk changes and removed once the install
+/// has finished, so that a crash or a failed download cannot pass for a complete tree.
+const INCOMPLETE: &str = ".microbe-incomplete";
 /// Matches npm's and pnpm's default network concurrency.
 const DEFAULT_CONCURRENCY: usize = 16;
 const RETRIES: usize = 2;
@@ -57,6 +66,9 @@ const RETRY_BACKOFF: [std::time::Duration; RETRIES] = [
     std::time::Duration::from_secs(2),
 ];
 
+/// An installer: a transport plus where to find packages and which credentials to send.
+/// Configure it with the builder methods, then call [`Microbe::install`] or
+/// [`Microbe::install_all`] as often as needed. Each call reads the registry afresh.
 pub struct Microbe {
     transport: Box<dyn Transport>,
     registry: String,
@@ -91,6 +103,7 @@ pub struct Installation {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[non_exhaustive]
 pub struct Root {
+    /// The name it was requested under, which for an `npm:` alias is the alias.
     pub name: String,
     pub version: String,
     /// `<dir>/node_modules/<name>`.
@@ -105,6 +118,7 @@ impl Microbe {
         Ok(Self::from_boxed(transport::detect()?))
     }
 
+    /// An installer that makes every request through `transport`.
     pub fn with_transport(transport: impl Transport + 'static) -> Self {
         Self::from_boxed(Box::new(transport))
     }
@@ -120,6 +134,7 @@ impl Microbe {
         }
     }
 
+    /// The registry for packages no [`Microbe::scoped_registry`] claims.
     pub fn registry(mut self, url: &str) -> Self {
         self.registry = url.trim_end_matches('/').to_string();
         self
@@ -150,7 +165,7 @@ impl Microbe {
     /// them. Nothing is discovered, and `${VAR}` is not expanded — resolve it and use
     /// [`Microbe::npmrc_contents`].
     pub fn npmrc(self, path: &Path) -> Result<Self, Error> {
-        let contents = std::fs::read_to_string(path)?;
+        let contents = std::fs::read_to_string(path).map_err(|e| at(path, e))?;
         self.npmrc_contents(&contents)
     }
 
@@ -171,17 +186,19 @@ impl Microbe {
         self
     }
 
-    /// `spec` is `name`, `name@tag`, `name@version` or `name@range` (`@scope/name@^1` works).
-    /// `dir` is created if needed; packages go under `dir/node_modules/`.
+    /// `spec` is `name`, `name@tag`, `name@version` or `name@range` (`@scope/name@^1` works),
+    /// or an alias, `name@npm:real@range`. `dir` is created if needed; packages go under
+    /// `dir/node_modules/`.
     pub fn install(&self, spec: &str, dir: &Path) -> Result<Installation, Error> {
         let (name, range) = split_spec(spec);
         self.install_all([(name, range)], dir)
     }
 
     /// Install every `(name, range)` pair — the shape of a `package.json` `dependencies`
-    /// map — into one `dir/node_modules`, and link every command a top-level package
-    /// declares under `dir/node_modules/.bin`. A name given twice is taken once, at its
-    /// first range. `peerDependencies` are ignored throughout.
+    /// map, so a range may be a dist-tag or `npm:real@range` — into one `dir/node_modules`,
+    /// and link every command a top-level package declares under `dir/node_modules/.bin`.
+    /// A name given twice is taken once, at its first range. `peerDependencies` are ignored
+    /// throughout.
     pub fn install_all<'a>(
         &self,
         deps: impl IntoIterator<Item = (&'a str, &'a str)>,
@@ -192,11 +209,18 @@ impl Microbe {
             .into_iter()
             .filter(|(name, _)| seen.insert(*name))
             .collect();
-        std::fs::create_dir_all(dir)?;
+        std::fs::create_dir_all(dir).map_err(|e| at(dir, e))?;
         let root = canonical(dir)?;
-        let mut plan = self.plan(&root, &deps)?;
-        let live = self.materialize(&mut plan)?;
+        if let Ok(mut cache) = self.packuments.lock() {
+            cache.clear();
+        }
+        let marker = root.join("node_modules").join(INCOMPLETE);
+        let mut plan = self.plan(&root, &deps, marker.exists())?;
+        let live = self.materialize(&mut plan, &marker)?;
         let bins = link_bins(&root, &plan, &live)?;
+        if plan.packages.iter().any(|p| p.fetch) {
+            let _ = std::fs::remove_file(&marker);
+        }
         let kept = || plan.packages.iter().zip(&live).filter(|(_, l)| **l);
         Ok(Installation {
             roots: plan
@@ -215,7 +239,7 @@ impl Microbe {
             packages: kept().filter(|(p, _)| p.fetch).count(),
             skipped_install_scripts: kept()
                 .filter(|(p, _)| p.manifest.has_install_script)
-                .map(|(p, _)| format!("{}@{}", p.name, p.version))
+                .map(|(p, _)| format!("{}@{}", p.package, p.version))
                 .collect(),
         })
     }
@@ -224,8 +248,11 @@ impl Microbe {
     /// name is reached first from the requested packages takes the flat slot, and later
     /// conflicting versions nest under their dependents. Each level's packuments are fetched
     /// together before any of that level is placed.
-    fn plan(&self, root: &Path, deps: &[(&str, &str)]) -> Result<Plan, Error> {
-        let mut plan = Plan::default();
+    fn plan(&self, root: &Path, deps: &[(&str, &str)], distrust_disk: bool) -> Result<Plan, Error> {
+        let mut plan = Plan {
+            distrust_disk,
+            ..Plan::default()
+        };
         let mut level: VecDeque<Want> = deps
             .iter()
             .map(|(name, range)| Want {
@@ -238,19 +265,15 @@ impl Microbe {
             })
             .collect();
         while !level.is_empty() {
-            self.prefetch(level.iter().map(|w| w.name.as_str()));
+            self.prefetch(
+                level
+                    .iter()
+                    .filter(|w| w.safe() && plan.satisfied(root, w, w.target().1).is_none())
+                    .map(|w| w.target().0),
+            );
             let mut next = VecDeque::new();
             for want in level.drain(..) {
-                let placed = match self.place(root, &mut plan, &want)? {
-                    Some(i) => Some(i),
-                    // A requested package already on disk at a satisfying version is planned
-                    // unfetched, so its bins are still linked and its own tree still checked.
-                    None if want.parent.is_none() => {
-                        Some(self.plan_present(root, &mut plan, &want)?)
-                    }
-                    None => None,
-                };
-                if let Some(i) = placed {
+                if let Some(i) = self.place(root, &mut plan, &want)? {
                     if want.parent.is_none() {
                         plan.roots.push(i);
                     }
@@ -262,61 +285,66 @@ impl Microbe {
         Ok(plan)
     }
 
-    fn plan_present(&self, root: &Path, plan: &mut Plan, want: &Want) -> Result<usize, Error> {
-        let (version, dir) = plan
-            .satisfied(root, root, &want.name, &want.range)?
-            .expect("a requested package is either placed or already present");
-        let manifest = self.manifest_for(&want.name, &version)?;
-        Ok(plan.push(Planned {
-            name: want.name.clone(),
-            version,
-            dir,
-            manifest,
-            fetch: false,
-            children: Vec::new(),
-        }))
-    }
-
     /// Decide where one wanted package goes. Returns the index of a newly planned package so
     /// the caller can enqueue its dependencies; `None` when the want was already satisfied,
     /// was skipped, or failed softly.
     fn place(&self, root: &Path, plan: &mut Plan, want: &Want) -> Result<Option<usize>, Error> {
-        if let Some((_, dir)) = plan.satisfied(root, &want.parent_dir, &want.name, &want.range)? {
-            // An edge to a package planned earlier. It is what lets a package first reached
-            // through an optional branch turn out to be required after all.
+        if !want.safe() {
+            return unresolved(plan, want, Error::UnsafePath(want.name.clone()));
+        }
+        let (package, spec) = want.target();
+        let spec = if spec.is_empty() { "latest" } else { spec };
+        // A dist-tag has no range to test a present package against, so it stands for the
+        // version it points at right now.
+        let tagged = if registry::is_range(spec) {
+            None
+        } else {
+            match self.with_packument(package, |p| p.dist_tags.get(spec).cloned()) {
+                Ok(version) => version,
+                Err(e) => return unresolved(plan, want, e),
+            }
+        };
+        let range = tagged.as_deref().unwrap_or(spec);
+        if let Some(dir) = plan.satisfied(root, want, range) {
             if let Some(&child) = plan.index.get(&dir) {
+                // An edge to a package planned earlier. It is what lets a package first
+                // reached through an optional branch turn out to be required after all.
                 plan.link(want, child);
+            } else if want.parent.is_none()
+                && let Some(found) = plan.on_disk(&dir)
+            {
+                // Planned unfetched, so its bins are still linked and it is still reported.
+                return Ok(Some(plan.push(Planned {
+                    name: want.name.clone(),
+                    package: found.name,
+                    version: found.version,
+                    dir,
+                    manifest: found.manifest,
+                    fetch: false,
+                    children: Vec::new(),
+                })));
             }
             return Ok(None);
         }
-        let picked = self.with_packument(&want.name, |p| {
-            registry::pick(p, &want.name, &want.range).map(|(v, m)| (v.to_string(), m.clone()))
+        let picked = self.with_packument(package, |p| {
+            registry::pick(p, package, range).map(|(v, m)| (v.to_string(), m.clone()))
         });
-        let (version, manifest) = match picked {
-            Ok(Ok(vm)) => vm,
-            // An optional dependency that is unpublished or unresolvable is simply absent.
-            Err(_) | Ok(Err(_)) if want.optional_edge => return Ok(None),
-            // A required dependency of a package that is itself only optionally reachable
-            // (so far): charge the failure to that package and let `settle` decide.
-            Err(e) | Ok(Err(e)) if want.soft => {
-                if let Some(parent) = want.parent {
-                    plan.failures.push((parent, e));
-                }
-                return Ok(None);
-            }
-            Err(e) | Ok(Err(e)) => return Err(e),
+        let (version, manifest) = match picked.and_then(|p| p) {
+            Ok(vm) => vm,
+            Err(e) => return unresolved(plan, want, e),
         };
         if want.optional_edge && !registry::platform_allowed(&manifest) {
             return Ok(None);
         }
         let flat = root.join("node_modules").join(&want.name);
-        let dir = if plan.index.contains_key(&flat) || installed_version(&flat)?.is_some() {
+        let dir = if plan.index.contains_key(&flat) || plan.on_disk(&flat).is_some() {
             want.parent_dir.join("node_modules").join(&want.name)
         } else {
             flat
         };
         let child = plan.push(Planned {
             name: want.name.clone(),
+            package: package.to_string(),
             version,
             dir,
             manifest,
@@ -330,18 +358,24 @@ impl Microbe {
     /// Phase two: every live planned tarball, `concurrency` at a time, then one more
     /// [`settle`] with the fetch failures folded in. Returns which packages are live, and
     /// removes from disk whatever a dropped branch had already extracted.
-    fn materialize(&self, plan: &mut Plan) -> Result<Vec<bool>, Error> {
+    fn materialize(&self, plan: &mut Plan, marker: &Path) -> Result<Vec<bool>, Error> {
         let failures = std::mem::take(&mut plan.failures);
         let before = settle(plan, failures)?;
         let todo: Vec<usize> = (0..plan.packages.len())
             .filter(|&i| before.live[i] && plan.packages[i].fetch)
             .collect();
+        if !todo.is_empty()
+            && let Some(node_modules) = marker.parent()
+        {
+            std::fs::create_dir_all(node_modules).map_err(|e| at(node_modules, e))?;
+            std::fs::write(marker, "").map_err(|e| at(marker, e))?;
+        }
         // A directory about to receive another version is replaced, not overlaid, and before
         // the parallel phase: a package nested under it may be extracting at the same time.
         for &i in &todo {
             let dir = &plan.packages[i].dir;
             if dir.symlink_metadata().is_ok() {
-                std::fs::remove_dir_all(dir)?;
+                std::fs::remove_dir_all(dir).map_err(|e| at(dir, e))?;
             }
         }
         let next = AtomicUsize::new(0);
@@ -381,9 +415,12 @@ impl Microbe {
     }
 
     fn fetch_one(&self, p: &Planned) -> Result<(), Error> {
-        let tgz = self.fetch(&p.manifest.dist.tarball, "application/octet-stream")?;
-        extract::verify(&tgz, &p.manifest.dist, &p.name, &p.version)?;
-        extract::extract(&tgz, &p.dir)
+        let tgz = self.fetch(&p.manifest.dist.tarball, "*/*")?;
+        extract::verify(&tgz, &p.manifest.dist, &p.package, &p.version)?;
+        extract::extract(&tgz, &p.dir).map_err(|e| match e {
+            Error::Io(io) => at(&p.dir, io),
+            other => other,
+        })
     }
 
     /// Fetch every packument in `names` that is not cached yet, `concurrency` at a time.
@@ -470,18 +507,6 @@ impl Microbe {
         }
     }
 
-    fn manifest_for(&self, name: &str, version: &str) -> Result<Manifest, Error> {
-        self.with_packument(name, |p| {
-            p.versions
-                .get(version)
-                .cloned()
-                .ok_or_else(|| Error::NoVersion {
-                    name: name.to_string(),
-                    spec: version.to_string(),
-                })
-        })?
-    }
-
     /// Run `f` over the abbreviated packument for `name`, fetching it on first use. One
     /// registry round-trip per package name per install, however many dependents share it.
     fn with_packument<R>(&self, name: &str, f: impl FnOnce(&Packument) -> R) -> Result<R, Error> {
@@ -494,6 +519,22 @@ impl Microbe {
             cache.insert(name.to_string(), p);
         }
         Ok(f(&cache[name]))
+    }
+}
+
+/// A dependency that cannot be resolved. An optional edge simply goes without it. A required
+/// dependency of a package that is itself only optionally reachable (so far) is charged to
+/// that package for [`settle`] to decide. Anything else ends the install.
+fn unresolved(plan: &mut Plan, want: &Want, error: Error) -> Result<Option<usize>, Error> {
+    if want.optional_edge {
+        return Ok(None);
+    }
+    match want.parent {
+        Some(parent) if want.soft => {
+            plan.failures.push((parent, error));
+            Ok(None)
+        }
+        _ => Err(error),
     }
 }
 
@@ -512,8 +553,23 @@ struct Want {
     soft: bool,
 }
 
+impl Want {
+    /// The package and range this edge resolves. For `npm:real@range` that is the real
+    /// package, which lands under the alias.
+    fn target(&self) -> (&str, &str) {
+        registry::alias(&self.range).unwrap_or((&self.name, &self.range))
+    }
+
+    fn safe(&self) -> bool {
+        registry::safe_name(&self.name) && registry::safe_name(self.target().0)
+    }
+}
+
 struct Planned {
+    /// The directory name under `node_modules`.
     name: String,
+    /// The package itself; differs from `name` for an `npm:` alias.
+    package: String,
     version: String,
     dir: PathBuf,
     manifest: Manifest,
@@ -562,6 +618,8 @@ struct Plan {
     index: HashMap<PathBuf, usize>,
     /// `(package to drop, why)`: a package whose required dependency could not be resolved.
     failures: Vec<(usize, Error)>,
+    /// The last install here did not finish, so nothing on disk can be taken as complete.
+    distrust_disk: bool,
 }
 
 impl Plan {
@@ -579,34 +637,44 @@ impl Plan {
         }
     }
 
-    /// Walk from the dependent's directory up to the install root looking for `name` at a
-    /// version satisfying `range`, in the plan first and then on disk — Node's own resolution
-    /// order, so whatever is found here is what `require` will find too.
-    fn satisfied(
-        &self,
-        root: &Path,
-        parent: &Path,
-        name: &str,
-        range: &str,
-    ) -> Result<Option<(String, PathBuf)>, Error> {
-        let mut dir = Some(parent);
+    fn on_disk(&self, dir: &Path) -> Option<registry::Installed> {
+        if self.distrust_disk {
+            return None;
+        }
+        registry::installed(dir)
+    }
+
+    /// Walk from the dependent's directory up to the install root looking for the package at
+    /// a version satisfying `range`, in the plan first and then on disk — Node's own
+    /// resolution order, so whatever is found here is what `require` will find too. The
+    /// directory of a package about to be replaced is not looked into: what is on disk under
+    /// it goes with it.
+    fn satisfied(&self, root: &Path, want: &Want, range: &str) -> Option<PathBuf> {
+        let package = want.target().0;
+        let mut dir = Some(want.parent_dir.as_path());
         while let Some(d) = dir {
-            let candidate = d.join("node_modules").join(name);
-            let version = match self.index.get(&candidate) {
-                Some(&i) => Some(self.packages[i].version.clone()),
-                None => installed_version(&candidate)?,
+            let candidate = d.join("node_modules").join(&want.name);
+            let replaced = self.index.get(d).is_some_and(|&i| self.packages[i].fetch);
+            let found = match self.index.get(&candidate) {
+                Some(&i) => Some((
+                    self.packages[i].package.clone(),
+                    self.packages[i].version.clone(),
+                )),
+                None if replaced => None,
+                None => self.on_disk(&candidate).map(|p| (p.name, p.version)),
             };
-            if let Some(v) = version
-                && registry::satisfies(&v, range)
+            if let Some((name, version)) = found
+                && name == package
+                && registry::satisfies(&version, range)
             {
-                return Ok(Some((v, candidate)));
+                return Some(candidate);
             }
             if d == root {
                 break;
             }
             dir = d.parent();
         }
-        Ok(None)
+        None
     }
 }
 
@@ -699,19 +767,30 @@ fn link_bins(root: &Path, plan: &Plan, live: &[bool]) -> Result<BTreeMap<String,
         if !live[i] || p.dir != nm.join(&p.name) {
             continue;
         }
-        for (cmd, rel) in p.manifest.bin.entries(&p.name) {
+        for (cmd, rel) in p.manifest.bin.entries(&p.package) {
+            // Both come from the registry: a bin must not be chmodded or linked outside its
+            // own package.
+            let inside = Path::new(&rel)
+                .components()
+                .all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
+            let rel: PathBuf = Path::new(&rel)
+                .components()
+                .filter(|c| matches!(c, Component::Normal(_)))
+                .collect();
             let target = p.dir.join(&rel);
             if bins.contains_key(&cmd)
                 || cmd.is_empty()
-                || cmd.contains(['/', '\\'])
+                || cmd.contains(['/', '\\', ':'])
+                || cmd == "."
                 || cmd == ".."
+                || !inside
                 || !target.is_file()
             {
                 continue;
             }
             make_executable(&target)?;
             std::fs::create_dir_all(&bin_dir)?;
-            write_bin_link(&bin_dir, &cmd, &p.name, &rel)?;
+            write_bin_link(&bin_dir, &cmd, &p.name, &rel.to_string_lossy())?;
             bins.insert(cmd, target);
         }
     }
@@ -738,20 +817,12 @@ fn write_bin_link(bin_dir: &Path, cmd: &str, name: &str, rel: &str) -> Result<()
     Ok(())
 }
 
-fn installed_version(pkg_dir: &Path) -> Result<Option<String>, Error> {
-    let manifest = pkg_dir.join("package.json");
-    if !manifest.is_file() {
-        return Ok(None);
-    }
-    #[derive(serde::Deserialize)]
-    struct V {
-        version: String,
-    }
-    let v: V = serde_json::from_slice(&std::fs::read(&manifest)?).map_err(|e| Error::Registry {
-        name: pkg_dir.display().to_string(),
-        detail: e.to_string(),
-    })?;
-    Ok(Some(v.version))
+/// An I/O error that names the path it happened on.
+fn at(path: &Path, error: std::io::Error) -> Error {
+    Error::Io(std::io::Error::new(
+        error.kind(),
+        format!("{}: {error}", path.display()),
+    ))
 }
 
 /// [`Path::canonicalize`] without the `\\?\` verbatim prefix Windows adds: every path this
@@ -770,10 +841,13 @@ fn canonical(dir: &Path) -> Result<PathBuf, Error> {
 }
 
 /// `@scope/name@^1` → (`@scope/name`, `^1`); a bare name has an empty range (→ `latest`).
-fn split_spec(spec: &str) -> (&str, &str) {
-    match spec.rfind('@') {
-        Some(i) if i > 0 => (&spec[..i], &spec[i + 1..]),
-        _ => (spec, ""),
+/// The split is on the first `@` past a scope's, because an alias's range has one of its own:
+/// `tool@npm:@scope/real@^1`. Public for the binary and the addon only.
+#[doc(hidden)]
+pub fn split_spec(spec: &str) -> (&str, &str) {
+    match spec.get(1..).and_then(|rest| rest.find('@')) {
+        Some(i) => (&spec[..=i], &spec[i + 2..]),
+        None => (spec, ""),
     }
 }
 
@@ -798,10 +872,12 @@ mod tests {
     use super::split_spec;
 
     #[test]
-    fn spec_splits_on_the_last_at_sign_only() {
+    fn spec_splits_on_the_first_at_sign_past_the_scope() {
         assert_eq!(split_spec("chalk"), ("chalk", ""));
         assert_eq!(split_spec("chalk@5"), ("chalk", "5"));
         assert_eq!(split_spec("@scope/name"), ("@scope/name", ""));
         assert_eq!(split_spec("@scope/name@^1.2"), ("@scope/name", "^1.2"));
+        assert_eq!(split_spec("a@npm:@scope/b@^1"), ("a", "npm:@scope/b@^1"));
+        assert_eq!(split_spec("@s/a@npm:b"), ("@s/a", "npm:b"));
     }
 }
